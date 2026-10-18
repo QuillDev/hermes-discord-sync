@@ -1,13 +1,17 @@
-"""Stateful external service simulators; plugin collaborators remain real."""
+"""Stateful simulators for what the plugin does not own: Discord, the Hermes backend and its pins."""
+
 import json
+import time
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import aiohttp
 import pytest_asyncio
 from aiohttp import web
 
 from dashboard.sync.bridge import Bridge
-from dashboard.sync.discord import Discord
+from dashboard.sync.discord import DISCORD_EPOCH_MS, Discord
+from dashboard.sync.inbox import Inbox
 from dashboard.sync.rpc import Rpc
 from dashboard.sync.store import Store
 
@@ -26,14 +30,16 @@ class ExternalServices:
         self.nonces = {}
         self.open_requests = []
         self.sessions = []
+        self.forum_tags = []
+        self.typing = []
 
     def add_post(self, name, content, user="42", parent="forum"):
         # Discord forum posts: the starter message id equals the thread id.
-        import time
-        tid = str(((int(time.time() * 1000) - 1420070400000) << 22) + int(self.mid()))
+        tid = str(((int(time.time() * 1000) - DISCORD_EPOCH_MS) << 22) + int(self.mid()))
         self.threads[tid] = {"name": name, "messages": [], "archived": False, "parent_id": parent}
-        self.threads[tid]["messages"].append({"id": tid, "channel_id": tid, "content": content,
-                                              "author": {"id": user, "bot": False}})
+        self.threads[tid]["messages"].append(
+            {"id": tid, "channel_id": tid, "content": content, "author": {"id": user, "bot": False}}
+        )
         return tid
 
     def mid(self):
@@ -41,16 +47,28 @@ class ExternalServices:
         return str(self.counter)
 
     def add_message(self, thread, content, user="42", **extra):
-        message = {"id": self.mid(), "channel_id": thread, "content": content,
-                   "author": {"id": user, "bot": user == "bot"}, **extra}
+        message = {
+            "id": self.mid(),
+            "channel_id": thread,
+            "content": content,
+            "author": {"id": user, "bot": user == "bot"},
+            **extra,
+        }
         self.threads[thread]["messages"].append(message)
         return message
 
     async def event(self, kind, payload=None):
         self.seq += 1
-        frame = {"jsonrpc": "2.0", "method": "event", "params": {
-            "type": kind, "session_id": "live-one", "seq": self.seq, "payload": payload or {},
-        }}
+        frame = {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "type": kind,
+                "session_id": "live-one",
+                "seq": self.seq,
+                "payload": payload or {},
+            },
+        }
         for socket in self.sockets:
             if not socket.closed:
                 await socket.send_json(frame)
@@ -68,25 +86,40 @@ class ExternalServices:
             if method == "client.capabilities":
                 result = {"server_requests": ["approval", "clarify"]}
             elif method == "session.list":
-                result = {"sessions": [{"id": "session-one", "source": "desktop", "title": "task"},
-                                       *self.sessions]}
+                result = {
+                    "sessions": [{"id": "session-one", "source": "desktop", "title": "task"}, *self.sessions]
+                }
             elif method == "session.create":
-                existing = next((row for row in self.sessions
-                                 if row["key"] == params.get("idempotency_key")), None)
+                existing = next(
+                    (row for row in self.sessions if row["key"] == params.get("idempotency_key")), None
+                )
                 if existing is None:
-                    import time
-                    existing = {"id": f"stored-{len(self.sessions) + 2}", "source": params["source"],
-                                "title": params.get("title", ""), "started_at": time.time(),
-                                "key": params.get("idempotency_key")}
+                    existing = {
+                        "id": f"stored-{len(self.sessions) + 2}",
+                        "source": params["source"],
+                        "title": params.get("title", ""),
+                        "started_at": time.time(),
+                        "key": params.get("idempotency_key"),
+                    }
                     self.sessions.append(existing)
                 result = {"session_id": "live-" + existing["id"], "stored_session_id": existing["id"]}
             elif method in {"session.resume", "session.activate"}:
                 live = "live-one" if params["session_id"] == "session-one" else "live-" + params["session_id"]
-                result = {"session_id": live, "stored_session_id": "session-one",
-                          "messages": [], "info": {}, "message_count": len(self.rows)}
+                result = {
+                    "session_id": live,
+                    "stored_session_id": "session-one",
+                    "messages": [],
+                    "info": {},
+                    "message_count": len(self.rows),
+                }
             elif method == "session.events.since":
-                result = {"events": [], "latest_seq": self.seq, "open_requests": self.open_requests,
-                          "truncated": False, "epoch": "test"}
+                result = {
+                    "events": [],
+                    "latest_seq": self.seq,
+                    "open_requests": self.open_requests,
+                    "truncated": False,
+                    "epoch": "test",
+                }
             elif method == "session.history":
                 result = {"messages": self.rows, "count": len(self.rows)}
             elif method == "prompt.submit":
@@ -122,12 +155,18 @@ class ExternalServices:
             if method == "PATCH":
                 tags = (await request.json())["available_tags"]
                 self.forum_tags = [{**tag, "id": tag.get("id") or self.mid()} for tag in tags]
-            return web.json_response({"id": "forum", "type": 15, "guild_id": "guild",
-                                      "available_tags": getattr(self, "forum_tags", [])})
+            return web.json_response(
+                {"id": "forum", "type": 15, "guild_id": "guild", "available_tags": self.forum_tags}
+            )
         if path[0] == "guilds":
-            return web.json_response({"threads": [
-                {"id": tid, "name": t["name"], "parent_id": t.get("parent_id", "forum")}
-                for tid, t in self.threads.items()]})
+            return web.json_response(
+                {
+                    "threads": [
+                        {"id": tid, "name": t["name"], "parent_id": t.get("parent_id", "forum")}
+                        for tid, t in self.threads.items()
+                    ]
+                }
+            )
         if len(path) == 3 and path[2] == "threads" and method == "POST":
             payload = await request.json()
             tid = self.mid()
@@ -135,16 +174,22 @@ class ExternalServices:
             starter = self.add_message(tid, payload["message"]["content"], "bot")
             return web.json_response({"id": tid, "message": starter})
         if len(path) == 3 and path[2] == "typing":
-            self.typing = [*getattr(self, "typing", []), channel]
+            self.typing.append(channel)
             return web.Response(status=204)
-        thread = self.threads.setdefault(channel, {"name": channel, "messages": [], "archived": False,
-                                                   "parent_id": "text"})
+        thread = self.threads.setdefault(
+            channel, {"name": channel, "messages": [], "archived": False, "parent_id": "text"}
+        )
         if len(path) == 2:
             if method == "PATCH":
                 thread.update(await request.json())
-            return web.json_response({"id": channel, "name": thread["name"],
-                                      "applied_tags": thread.get("applied_tags", []),
-                                      "thread_metadata": {"archived": thread["archived"]}})
+            return web.json_response(
+                {
+                    "id": channel,
+                    "name": thread["name"],
+                    "applied_tags": thread.get("applied_tags", []),
+                    "thread_metadata": {"archived": thread["archived"]},
+                }
+            )
         if len(path) == 3 and method == "GET":
             before = int(request.query.get("before", "9999999999999999999"))
             messages = [message for message in thread["messages"] if int(message["id"]) < before]
@@ -173,6 +218,33 @@ class ExternalServices:
         raise AssertionError(f"Unhandled external request {method} {path}")
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class FakePins:
+    """Desktop's pinned sessions, as Hermes stores them."""
+
+    def __init__(self):
+        self.sessions = set()
+
+    def pinned(self):
+        return set(self.sessions)
+
+    def set(self, session, pinned):
+        if pinned:
+            self.sessions.add(session)
+        else:
+            self.sessions.discard(session)
+
+
 @asynccontextmanager
 async def serving(app):
     runner = web.AppRunner(app)
@@ -187,7 +259,7 @@ async def serving(app):
 
 
 @pytest_asyncio.fixture
-async def connected(tmp_path):
+async def world(tmp_path):
     external = ExternalServices()
     app = web.Application()
     app.router.add_get("/api/ws", external.ws)
@@ -196,11 +268,24 @@ async def connected(tmp_path):
         rpc = Rpc(http, base + "/api/ws")
         await rpc.connect()
         store = Store(tmp_path / "sync" / "state.db")
-        bridge = Bridge(rpc, Discord(http, "test-token", base + "/discord"), store, "forum", ["42"])
+        inbox = Inbox(tmp_path / "sync" / "inbox")
+        pins = FakePins()
+        clock = FakeClock()
+        discord = Discord(http, "test-token", base + "/discord")
+        bridge = Bridge(rpc, discord, store, "forum", ["42"], inbox=inbox, pins=pins, clock=clock)
         await bridge.discord.validate("forum")
         await bridge.link("session-one")
         try:
-            yield bridge, external, http, base
+            yield SimpleNamespace(
+                bridge=bridge,
+                external=external,
+                http=http,
+                base=base,
+                inbox=inbox,
+                pins=pins,
+                clock=clock,
+                link=store.links()[0],
+            )
         finally:
             await bridge.close()
             for socket in external.sockets:

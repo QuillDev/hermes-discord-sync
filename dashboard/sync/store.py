@@ -1,4 +1,5 @@
 """Private durable mapping, not a copy of or writer to Hermes state.db."""
+
 from __future__ import annotations
 
 import json
@@ -36,8 +37,10 @@ class Store:
 
     def known(self, *, session=None, thread=None):
         # Includes unlinked rows: an explicit !unlink must not be undone by auto-linking.
-        row = self.db.execute("SELECT 1 FROM links WHERE session=? OR thread=?",
-                              (session, None if thread is None else str(thread))).fetchone()
+        row = self.db.execute(
+            "SELECT 1 FROM links WHERE session=? OR thread=?",
+            (session, None if thread is None else str(thread)),
+        ).fetchone()
         return row is not None
 
     def meta(self, key, default):
@@ -49,8 +52,10 @@ class Store:
         return str(default)
 
     def link(self, session, thread, title, cursor):
-        self.db.execute("INSERT INTO links(session,thread,title,cursor) VALUES(?,?,?,?)",
-                        (session, str(thread), title, str(cursor)))
+        self.db.execute(
+            "INSERT INTO links(session,thread,title,cursor) VALUES(?,?,?,?)",
+            (session, str(thread), title, str(cursor)),
+        )
         self.db.commit()
 
     def update(self, session, **values):
@@ -61,26 +66,42 @@ class Store:
         self.db.commit()
 
     def get_projection(self, session):
-        return {row["address"]: {**dict(row), "ids": json.loads(row["ids"])}
-                for row in self.db.execute("SELECT * FROM projection WHERE session=?", (session,))}
+        return {
+            row["address"]: {**dict(row), "ids": json.loads(row["ids"])}
+            for row in self.db.execute("SELECT * FROM projection WHERE session=?", (session,))
+        }
 
     def project(self, session, address, ids, body, owned=True):
-        self.db.execute("INSERT OR REPLACE INTO projection VALUES(?,?,?,?,?)",
-                        (session, address, json.dumps(ids), body, int(owned)))
+        self.db.execute(
+            "INSERT OR REPLACE INTO projection VALUES(?,?,?,?,?)",
+            (session, address, json.dumps(ids), body, int(owned)),
+        )
         self.db.commit()
 
     def forget(self, session, address):
         self.db.execute("DELETE FROM projection WHERE session=? AND address=?", (session, address))
         self.db.commit()
 
+    def pin(self, session):
+        """The pin state last mirrored for this session: True, False, or None if never mirrored."""
+        mirrored = self.get_projection(session).get("pin")
+        if mirrored is None:
+            return None
+        return mirrored["body"] == "1"
+
+    def set_pin(self, session, pinned):
+        self.project(session, "pin", [], "1" if pinned else "0")
+
     def inbox_status(self, thread, message):
-        row = self.db.execute("SELECT * FROM inbox WHERE thread=? AND message=?",
-                              (str(thread), str(message))).fetchone()
+        row = self.db.execute(
+            "SELECT * FROM inbox WHERE thread=? AND message=?", (str(thread), str(message))
+        ).fetchone()
         return dict(row) if row else None
 
     def received(self, thread, message, status, row_id=None):
-        self.db.execute("INSERT OR REPLACE INTO inbox VALUES(?,?,?,?)",
-                        (str(thread), str(message), status, row_id))
+        self.db.execute(
+            "INSERT OR REPLACE INTO inbox VALUES(?,?,?,?)", (str(thread), str(message), status, row_id)
+        )
         self.db.commit()
 
     def close(self):

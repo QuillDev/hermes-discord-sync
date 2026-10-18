@@ -1,4 +1,5 @@
 """Use the same public WebSocket RPC as Desktop; never open a second agent writer."""
+
 from __future__ import annotations
 
 import asyncio
@@ -25,8 +26,9 @@ class Rpc:
         self.reader = None
 
     async def connect(self):
-        self.ws = await self.http.ws_connect(self.url() if callable(self.url) else self.url,
-                                              max_msg_size=64 * 1024 * 1024, heartbeat=15)
+        self.ws = await self.http.ws_connect(
+            self.url() if callable(self.url) else self.url, max_msg_size=64 * 1024 * 1024, heartbeat=15
+        )
         self.reader = asyncio.create_task(self._read())
         await self.call("client.capabilities", {"server_requests": True})
 
@@ -64,11 +66,6 @@ class Rpc:
             return await asyncio.wait_for(future, timeout=90)
         finally:
             self.pending.pop(rid, None)
-
-    async def answer(self, rid, result):
-        if self.ws is None or self.ws.closed:
-            raise ConnectionError("Desktop backend is offline")
-        await self.ws.send_json({"jsonrpc": "2.0", "id": rid, "result": result})
 
     async def close(self):
         if self.ws is not None:
