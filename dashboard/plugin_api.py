@@ -34,6 +34,7 @@ Discord = importlib.import_module(_package + ".discord").Discord
 Inbox = importlib.import_module(_package + ".inbox").Inbox
 Rpc = importlib.import_module(_package + ".rpc").Rpc
 Store = importlib.import_module(_package + ".store").Store
+HermesWording = importlib.import_module(_package + ".wording").HermesWording
 
 log = logging.getLogger("hermes.discord-sync")
 PLUGIN = "discord-sync"
@@ -196,6 +197,7 @@ class _Service:
                 notify=_notify,
                 heartbeat=heartbeat.touch,
                 auto_link=bool(entry.get("auto_link", True)),
+                wording=HermesWording(),
             )
             log.info("Discord sync started for forum %s", forum)
             await self.bridge.serve()

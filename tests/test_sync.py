@@ -107,29 +107,158 @@ async def test_other_users_bots_and_webhooks_cannot_submit_or_approve(world):
     assert external.answers == {}
 
 
-async def test_approvals_and_clarifications_reach_the_same_backend_and_expire(world):
+def buttons(message):
+    return [button for row in message.get("components", []) for button in row["components"]]
+
+
+def card(external, thread, text):
+    return next(m for m in external.threads[thread]["messages"] if text in m["content"])
+
+
+async def test_approvals_are_buttons_that_resolve_in_place(world):
     bridge, external, link = world.bridge, world.external, world.link
-    approval = {"session_id": "live-one", "command": "sensitive command", "choices": ["once", "deny"]}
+    approval = {"session_id": "live-one", "command": "rm -rf build", "choices": ["once", "session", "deny"]}
     await bridge.show_request({"id": "srq-1", "method": "approval", "params": approval})
-    assert "!approve srq-1 once" in thread_text(external, link["thread"])
-    await bridge.receive(link, external.add_message(link["thread"], "!approve srq-1 always"))
+    prompt = card(external, link["thread"], "rm -rf build")
+    assert [button["label"] for button in buttons(prompt)] == ["Allow Once", "Allow Session", "Deny"]
+    # A stranger's press does nothing.
+    world.inbox.put(
+        {"kind": "press", "custom_id": buttons(prompt)[0]["custom_id"], "user": "99", "name": "x"}
+    )
+    await bridge.tick()
     assert external.answers == {}
-    await bridge.receive(link, external.add_message(link["thread"], "!approve srq-1 once"))
+    world.inbox.put(
+        {"kind": "press", "custom_id": buttons(prompt)[0]["custom_id"], "user": "42", "name": "Quill"}
+    )
+    await bridge.tick()
     assert external.answers["srq-1"] == {"choice": "once"}
+    # The card stays, greyed out, saying who decided what.
+    assert "Approved once by Quill" in prompt["content"]
+    assert all(button["disabled"] for button in buttons(prompt))
 
-    question = {"qid": "q1", "question": "which?", "choices": ["a", "b"]}
-    clarify = {"session_id": "live-one", "questions": [question]}
+
+async def test_a_plain_yes_answers_an_open_approval_and_the_text_command_still_works(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    approval = {"session_id": "live-one", "command": "deploy", "choices": ["once", "deny"]}
+    await bridge.show_request({"id": "srq-1", "method": "approval", "params": approval})
+    await bridge.receive(link, external.add_message(link["thread"], "yes"))
+    assert external.answers["srq-1"] == {"choice": "once"}
+    assert external.turns == []
+    await bridge.show_request({"id": "srq-2", "method": "approval", "params": approval})
+    await bridge.receive(link, external.add_message(link["thread"], "!approve srq-2 always"))
+    assert "srq-2" not in external.answers
+    await bridge.receive(link, external.add_message(link["thread"], "!approve srq-2 deny"))
+    assert external.answers["srq-2"] == {"choice": "deny"}
+
+
+async def test_clarify_options_are_buttons_and_a_typed_reply_answers_the_next_question(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    questions = [
+        {"qid": "q1", "question": "which branch?", "choices": ["main", "develop"]},
+        {"qid": "q2", "question": "why?"},
+    ]
+    external.questions["srq-2"] = ["q1", "q2"]
+    clarify = {"session_id": "live-one", "questions": questions}
     await bridge.show_request({"id": "srq-2", "method": "clarify", "params": clarify})
-    await bridge.receive(link, external.add_message(link["thread"], "!answer srq-2 1 2"))
-    assert external.answers["srq-2"] == {"answers": {"q1": "b"}}
+    prompt = card(external, link["thread"], "which branch?")
+    assert [button["label"] for button in buttons(prompt)] == ["1. main", "2. develop"]
+    world.inbox.put({"kind": "press", "custom_id": buttons(prompt)[1]["custom_id"], "user": "42"})
+    await bridge.tick()
+    assert "→ develop" in prompt["content"]
+    assert external.answers == {}
+    await bridge.receive(link, external.add_message(link["thread"], "release cut"))
+    assert external.answers["srq-2"] == {"answers": {"q1": "develop", "q2": "release cut"}}
+    # The reply answered the question; it never became a prompt.
+    assert external.turns == []
 
+
+async def test_a_cancelled_request_disappears_and_its_command_reports_it_closed(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    clarify = {"session_id": "live-one", "questions": [{"qid": "q1", "question": "which?", "choices": ["a"]}]}
     await bridge.show_request({"id": "srq-3", "method": "clarify", "params": clarify})
     cancel = {"type": "request.cancel", "session_id": "live-one", "payload": {"id": "srq-3"}}
     await bridge.event({"method": "event", "params": cancel})
-    assert "!answer srq-3" not in thread_text(external, link["thread"])
+    assert "which?" not in thread_text(external, link["thread"])
     await bridge.receive(link, external.add_message(link["thread"], "!answer srq-3 1 1"))
     assert "srq-3" not in external.answers
     assert "no longer open" in thread_text(external, link["thread"])
+
+
+async def test_message_status_shows_as_reactions_like_the_native_bot(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    thread = link["thread"]
+    first = external.add_message(thread, "build it")
+    await bridge.receive(link, first)
+    assert external.reacted(thread, first["id"]) == ["👀"]
+    # While that turn runs, a follow-up is steered in and says so.
+    external.busy_status = "steered"
+    steer = external.add_message(thread, "use the fast path")
+    await bridge.receive(link, steer)
+    assert external.reacted(thread, steer["id"]) == ["⏩"]
+    ack = external.threads[thread]["messages"][-1]
+    assert ack["reply_to"] == steer["id"]
+    assert ack["content"].startswith("⏩ Steered into current run")
+    # A queued one waits with ⏳ and takes over 👀 when its turn starts.
+    external.busy_status = "queued"
+    queued = external.add_message(thread, "then deploy")
+    await bridge.receive(link, queued)
+    assert external.reacted(thread, queued["id"]) == ["⏳"]
+    external.rows.append({"row_id": 50, "role": "assistant", "text": "built"})
+    await external.event("message.complete", {"status": "complete", "text": "built"})
+    await through(bridge, "message.complete")
+    assert external.reacted(thread, first["id"]) == ["✅"]
+    assert external.reacted(thread, queued["id"]) == ["👀"]
+    await external.event("message.complete", {"status": "interrupted", "text": ""})
+    await through(bridge, "message.complete")
+    assert external.reacted(thread, queued["id"]) == ["⏹️"]
+
+
+async def test_a_rejected_message_gets_a_failure_reaction(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    attachment = {"url": "http://127.0.0.1:9119/x", "size": 1, "filename": "x"}
+    message = external.add_message(link["thread"], "file", attachments=[attachment])
+    await bridge.receive(link, message)
+    assert external.reacted(link["thread"], message["id"]) == ["❌"]
+
+
+async def test_the_live_message_shows_tools_then_becomes_the_reply_in_place(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    thread = link["thread"]
+    await external.event("message.start")
+    await through(bridge, "message.start")
+    await external.event("tool.start", {"name": "terminal", "preview": "git status"})
+    await through(bridge, "tool.start")
+    await bridge.tick()
+    live = external.threads[thread]["messages"][-1]
+    assert "terminal: git status" in live["content"]
+    await external.event("message.delta", {"text": "all clean"})
+    await through(bridge, "message.delta")
+    world.clock.advance(STREAM_EDIT_EVERY)
+    await bridge.tick()
+    assert live["content"].endswith("all clean")
+    external.rows.append({"row_id": 7, "role": "assistant", "text": "all clean."})
+    await external.event("message.complete", {"status": "complete", "text": "all clean."})
+    await through(bridge, "message.complete")
+    # Same message, now the finished reply: nothing deleted and reposted.
+    assert live in external.threads[thread]["messages"]
+    assert live["content"] == "all clean."
+    assert bodies(external, thread).count("all clean.") == 1
+
+
+async def test_each_turn_gets_its_own_live_message(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    for _ in range(2):
+        await external.event("message.start")
+        await through(bridge, "message.start")
+        await external.event("message.delta", {"text": "same words"})
+        await through(bridge, "message.delta")
+        world.clock.advance(STREAM_EDIT_EVERY)
+        await bridge.tick()
+        # Discord deduplicates by nonce: a reused one hands back the first turn's deleted message.
+        assert bodies(external, link["thread"]).count("same words") == 1
+        await external.event("message.complete", {"status": "error", "error": "boom"})
+        await through(bridge, "message.complete")
+        assert bodies(external, link["thread"]).count("same words") == 0
 
 
 async def test_malformed_commands_show_usage_and_reach_nothing(world):
@@ -359,8 +488,12 @@ async def test_the_gateway_yields_the_sync_forum_and_mentions_only_while_the_bri
         pass
 
     bot = NativeBot()
+    seen = []
 
     def message(content, parent=None, mentions=(), author="217", channel=None):
+        async def add_reaction(emoji):
+            seen.append((content, emoji))
+
         return SimpleNamespace(
             channel=channel or SimpleNamespace(parent_id=parent, id=1),
             content=content,
@@ -370,7 +503,21 @@ async def test_the_gateway_yields_the_sync_forum_and_mentions_only_while_the_bri
             guild=object(),
             webhook_id=None,
             attachments=[],
+            add_reaction=add_reaction,
         )
+
+    acknowledged = []
+
+    def press(custom_id, user="217"):
+        async def defer():
+            acknowledged.append(("defer", custom_id))
+
+        async def send_message(text, ephemeral=False):
+            acknowledged.append(("offline", custom_id))
+
+        response = SimpleNamespace(defer=defer, send_message=send_message)
+        user = SimpleNamespace(id=user, display_name="Quill")
+        return SimpleNamespace(data={"custom_id": custom_id}, user=user, response=response)
 
     text_channel = TextChannel(id=77, parent_id=None)
     installers[0](bot, None)
@@ -386,15 +533,31 @@ async def test_the_gateway_yields_the_sync_forum_and_mentions_only_while_the_bri
     await bot.on_message(message("normal channel"))
     await bot.on_message(message("<@42> start a task", mentions=[bot.user], channel=text_channel))
     await bot.on_message(message("<@42> stranger", mentions=[bot.user], author="99", channel=text_channel))
+    await bot.on_message(message("someone else in the forum", 123, author="99"))
+    await bot.on_interaction(press("hds:approve:srq-1:once"))
+    await bot.on_interaction(press("native:button"))
     pushed = [event for _, event in Inbox(tmp_path / "discord-sync" / "inbox").pending()]
     assert [(event["kind"], event.get("message", {}).get("content")) for event in pushed] == [
         ("forum", "bridge alive: synced"),
         ("tags", None),
         ("mention", "<@42> start a task"),
+        ("forum", "someone else in the forum"),
+        ("press", None),
     ]
     assert pushed[1] == {"kind": "tags", "thread": "7", "tags": ["9"]}
+    assert pushed[4] == {
+        "kind": "press",
+        "custom_id": "hds:approve:srq-1:once",
+        "user": "217",
+        "name": "Quill",
+    }
+    # Allowed people see 👀 the moment the gateway hands their message over.
+    assert seen == [("bridge alive: synced", "👀"), ("<@42> start a task", "👀")]
+    assert acknowledged == [("defer", "hds:approve:srq-1:once")]
     os.utime(beat, (1, 1))
     await bot.on_message(message("bridge died: gateway answers", 123))
+    await bot.on_interaction(press("hds:approve:srq-1:once"))
+    assert acknowledged[-1] == ("offline", "hds:approve:srq-1:once")
     assert answered_by_gateway == [
         "bridge offline: gateway answers",
         "other forum",

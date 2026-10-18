@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import re
 import time
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlparse
 
+from . import wording as words
 from .discord import chunks, created_at
 from .rpc import RpcError
 
@@ -25,6 +28,14 @@ DEFAULT_TITLE = "discord session"
 PIN_TAG = "pinned"
 DESKTOP_ONLY = "needs the desktop app. secrets and desktop-only actions are not sent through discord."
 USAGE = "commands: !stop, !unlink, !approve <request> <choice>, !answer <request> <question> <answer>"
+BUTTON_PREFIX = "hds:"
+MAX_BUTTONS = 25
+ACTIVITY_LINES = 6
+PREVIEW_LIMIT = 80
+# Bare replies that answer an open approval, as the native gateway accepts them.
+APPROVE_WORDS = {"yes", "y", "approve", "allow", "ok"}
+DENY_WORDS = {"no", "n", "deny", "reject"}
+TURN_REACTIONS = {"error": words.FAILED, "interrupted": words.STOPPED}
 
 # Cadences, in seconds.
 STREAM_EDIT_EVERY = 1
@@ -53,7 +64,7 @@ class Cadence:
 
 
 def _is_command(text):
-    return text in {"!stop", "!unlink"} or text.startswith(("!approve ", "!answer "))
+    return text in {"!stop", "/stop", "!unlink"} or text.startswith(("!approve ", "!answer "))
 
 
 def _is_published(message):
@@ -81,19 +92,20 @@ def _title_from(text):
     return first_line[:90] or DEFAULT_TITLE
 
 
-def _approval_text(rid, params):
-    lines = [params.get("description") or "approval needed", params.get("command", "")]
-    lines += [f"`!approve {rid} {choice}`" for choice in params.get("choices", [])]
-    return "\n".join(lines)
+def _button(label, style, custom_id, disabled=False):
+    label = label[: words.BUTTON_LABEL_LIMIT]
+    return {"type": 2, "style": style, "label": label, "custom_id": custom_id, "disabled": disabled}
 
 
-def _clarify_text(rid, params):
-    lines = []
-    for index, question in enumerate(params.get("questions", []), 1):
-        lines.append(f"{index}. {question['question']}")
-        lines += [f"   {number}: {choice}" for number, choice in enumerate(question.get("choices") or [], 1)]
-        lines.append(f"`!answer {rid} {index} your answer`")
-    return "\n".join(lines) + "\n"
+def _rows(buttons):
+    """Discord action rows: five buttons each, at most five rows."""
+    buttons = buttons[:MAX_BUTTONS]
+    return [{"type": 1, "components": buttons[start : start + 5]} for start in range(0, len(buttons), 5)]
+
+
+def _preview(text):
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= PREVIEW_LIMIT else flat[: PREVIEW_LIMIT - 1] + "…"
 
 
 def _describe(error):
@@ -117,6 +129,7 @@ class Bridge:
         guard=None,
         heartbeat=None,
         auto_link=True,
+        wording=None,
         clock=time.monotonic,
     ):
         self.rpc = rpc
@@ -133,6 +146,7 @@ class Bridge:
         self.guard = guard or (lambda: True)
         self.heartbeat = heartbeat or (lambda: None)
         self.auto_link = auto_link
+        self.words = wording or words.Wording()
         # Only sessions started after sync was first enabled are auto-linked,
         # so enabling it never floods the forum with the whole history.
         self.auto_since = float(store.meta("auto_link_since", time.time()))
@@ -155,6 +169,12 @@ class Bridge:
         self.working = {}
         self.requests = {}
         self.last_seq = {}
+        # The Discord message each running turn answers, (thread, message id), and the
+        # messages queued behind it; their reactions show where each one stands.
+        self.owner = {}
+        self.waiting = {}
+        # Tool progress lines per running turn, shown above the streamed reply.
+        self.activity = {}
 
     # Lookups
 
@@ -244,7 +264,7 @@ class Bridge:
         self.last_seq[runtime] = 0
         return session
 
-    async def adopt(self, thread, starter=None):
+    async def adopt(self, thread, starter=None, *, pushed=False):
         """A new forum post becomes a real desktop session, not a gateway chat."""
         tid = str(thread["id"])
         already_seen = tid in self.ignored_threads or self.store.known(thread=tid)
@@ -259,7 +279,7 @@ class Bridge:
         session = await self._new_session(title, f"discord-sync:{tid}")
         # The cursor sits just before the starter, so the post itself is the first turn.
         self.store.link(session, tid, title, str(int(tid) - 1))
-        await self.receive(self._by_session(session), starter)
+        await self.receive(self._by_session(session), starter, pushed=pushed)
         self.store.update(session, cursor=tid)
         self.notify(session)
 
@@ -289,6 +309,8 @@ class Bridge:
         status = "ignored" if submitted is None else "accepted"
         row_id = None if submitted is None else submitted["row_id"]
         self.store.received(channel, mid, status, row_id)
+        outcome = "ignored" if submitted is None else submitted["status"]
+        await self._acknowledge(link, channel, mid, outcome)
         await self.reconcile(link)
 
     async def scan(self):
@@ -317,9 +339,11 @@ class Bridge:
 
     # Writing to Discord
 
-    async def upsert(self, link, address, body):
+    async def upsert(self, link, address, body, components=None):
+        # Buttons are part of what is shown: a change to them alone is an edit too.
+        shown = body if components is None else body + "\x00" + json.dumps(components)
         projection = self.store.get_projection(link["session"]).get(address)
-        if projection and projection["body"] == body:
+        if projection and projection["body"] == shown:
             return
         if projection and not projection["owned"]:
             # A bot cannot edit a human's message. Corrections are a separate
@@ -331,20 +355,29 @@ class Bridge:
         for index, part in enumerate(parts):
             # Long backfills keep the gateway reservation alive.
             self.heartbeat()
-            sent = await self._write_part(link, address, index, part, previous_ids)
+            # Buttons sit under the last part.
+            buttons = components if index == len(parts) - 1 else None
+            sent = await self._write_part(link, address, index, part, previous_ids, buttons)
             sent_ids.append(sent["id"])
         for stale in previous_ids[len(parts) :]:
             await self.discord.delete(link["thread"], stale)
-        self.store.project(link["session"], address, sent_ids, body)
+        self.store.project(link["session"], address, sent_ids, shown)
 
-    async def _write_part(self, link, address, index, part, previous_ids):
+    async def _write_part(self, link, address, index, part, previous_ids, components):
         """Edit the message already holding this part, or send a new one when there is none."""
+        thread = link["thread"]
         edited = None
         if index < len(previous_ids):
-            edited = await self.discord.edit(link["thread"], previous_ids[index], part)
+            edited = await self.discord.edit(thread, previous_ids[index], part, components=components)
         if edited is not None:
             return edited
-        return await self.discord.send(link["thread"], part, key=f"{link['session']}:{address}:{index}")
+        key = f"{link['session']}:{address}:{index}"
+        if not address.startswith("row:"):
+            # Discord returns the earlier message for a reused nonce, even a deleted one.
+            # Transcript rows keep a fixed key so a replay never posts twice; transient
+            # messages (each turn's live message, prompts, outcomes) get a fresh one.
+            key += f":{time.time_ns()}"
+        return await self.discord.send(thread, part, key=key, components=components)
 
     async def remove(self, link, address):
         projection = self.store.get_projection(link["session"]).get(address)
@@ -353,9 +386,11 @@ class Bridge:
             await self.discord.delete(link["thread"], mid)
         self.store.forget(link["session"], address)
 
-    async def reconcile(self, link):
+    async def reconcile(self, link, *, adopt_stream=False):
         runtime = self.runtime[link["session"]]
         history = await self.rpc.call("session.history", {"session_id": runtime})
+        if adopt_stream:
+            self._adopt_stream(link, history["messages"])
         published = set()
         for message in filter(_is_published, history["messages"]):
             address = f"row:{message['row_id']}"
@@ -370,6 +405,23 @@ class Bridge:
             if address.startswith("row:") and address not in published:
                 await self.remove(link, address)
         self.notify(link["session"])
+
+    def _adopt_stream(self, link, messages):
+        """The streamed reply becomes the finished row in place: edited, not deleted and reposted."""
+        projections = self.store.get_projection(link["session"])
+        stream = projections.get("stream")
+        if stream is None:
+            return
+        unshown = [
+            message
+            for message in filter(_is_published, messages)
+            if message["role"] == "assistant" and f"row:{message['row_id']}" not in projections
+        ]
+        if not unshown:
+            return
+        address = f"row:{unshown[-1]['row_id']}"
+        self.store.project(link["session"], address, stream["ids"], stream["body"])
+        self.store.forget(link["session"], "stream")
 
     async def artifacts(self, link, address, text):
         # Only explicit MEDIA: deliverables in assistant text, never tool args,
@@ -386,7 +438,7 @@ class Bridge:
 
     # Reading from Discord
 
-    async def receive(self, link, message):
+    async def receive(self, link, message, *, pushed=False):
         if not self.guard():
             raise ConnectionError("Gateway reservation unavailable")
         if not self._from_allowed_user(message):
@@ -397,9 +449,12 @@ class Bridge:
         if previous:
             await self._warn_if_unconfirmed(link, mid, previous)
             return
+        if not pushed:
+            # The gateway reacts the moment a pushed message arrives; the poll catches up here.
+            await self.discord.react(thread, mid, words.SEEN)
         self.store.received(thread, mid, "sending")
         try:
-            status, row_id = await self._accept(link, message)
+            status, row_id, outcome = await self._accept(link, message)
         except RpcError as error:
             await self._reject(link, mid, f"message was not accepted: {error}")
             return
@@ -407,26 +462,72 @@ class Bridge:
             await self._reject(link, mid, str(error))
             return
         self.store.received(thread, mid, status, row_id)
+        await self._acknowledge(link, thread, mid, outcome)
         # Transport failures deliberately keep the durable `sending` intent.
         # There is no prompt idempotency key in the host's current RPC contract:
         # an unacknowledged send MUST NOT be blindly replayed after reconnect.
 
     async def _accept(self, link, message):
-        """Run a command or submit a prompt. Returns the inbox status and the user row id."""
+        """Run a command, answer an open prompt or submit a prompt.
+
+        Returns the inbox status, the user row id and what happened to the message.
+        """
         text = message.get("content", "")
         if _is_command(text):
             await self.command(link, text)
-            return "accepted", None
+            return "accepted", None, "done"
+        if not message.get("attachments") and await self._answer_by_reply(link, text.strip()):
+            return "accepted", None, "done"
         submitted = await self._submit(link, text, message)
         if submitted is None:
-            return "ignored", None
+            return "ignored", None, "ignored"
         row_id = submitted["row_id"]
         if row_id is not None:
             # The human's own message already shows this row; the bot never reposts it.
             body = f"you: {submitted['prompt']}"
             self.store.project(link["session"], f"row:{row_id}", [str(message["id"])], body, owned=False)
         self.notify(link["session"])
-        return "accepted", row_id
+        return "accepted", row_id, submitted["status"]
+
+    async def _acknowledge(self, link, channel, mid, outcome):
+        """Say where a message stands, the way the native bot does: reactions plus a busy ack."""
+        if outcome == "done":
+            await self._swap(channel, mid, words.SEEN, words.DONE)
+            return
+        if outcome == "ignored":
+            await self.discord.unreact(channel, mid, words.SEEN)
+            return
+        runtime = self.runtime[link["session"]]
+        busy = words.STATUS_REACTIONS.get(outcome)
+        if busy is None:
+            # A new turn: this message keeps 👀 until the turn finishes. An older
+            # owner whose completion was missed (a reconnect) is done by now.
+            await self._finish_turn(runtime, "complete", promote=False)
+            self.owner[runtime] = (channel, mid)
+            return
+        await self._swap(channel, mid, words.SEEN, busy)
+        if outcome == "queued":
+            self.waiting.setdefault(runtime, deque()).append((channel, mid))
+        ack = self.words.ack(outcome)
+        if ack:
+            await self.discord.reply(channel, mid, ack, key=f"ack:{mid}")
+
+    async def _swap(self, channel, mid, old, new):
+        # Add before removing, so the message is never without a status.
+        await self.discord.react(channel, mid, new)
+        await self.discord.unreact(channel, mid, old)
+
+    async def _finish_turn(self, runtime, status, *, promote=True):
+        """Mark the message a turn answered, then hand 👀 to the next queued message."""
+        owner = self.owner.pop(runtime, None)
+        if owner is not None:
+            await self._swap(*owner, words.SEEN, TURN_REACTIONS.get(status, words.DONE))
+        queued = self.waiting.get(runtime)
+        if not promote or not queued:
+            return
+        following = queued.popleft()
+        await self._swap(*following, words.QUEUED, words.SEEN)
+        self.owner[runtime] = following
 
     async def _submit(self, link, text, message):
         """Send a prompt into the shared session. Returns None when there is nothing to send."""
@@ -442,10 +543,12 @@ class Bridge:
         )
         self.working[runtime] = link
         await self.discord.typing(link["thread"])
-        return {"prompt": prompt, "row_id": result.get("user_row_id")}
+        status = result.get("status") or "streaming"
+        return {"prompt": prompt, "row_id": result.get("user_row_id"), "status": status}
 
     async def _reject(self, link, mid, reason):
         self.store.received(link["thread"], mid, "rejected")
+        await self._swap(link["thread"], mid, words.SEEN, words.FAILED)
         await self.upsert(link, f"rejected:{mid}", reason)
 
     async def _warn_if_unconfirmed(self, link, mid, previous):
@@ -490,7 +593,12 @@ class Bridge:
         """Handle what the gateway pushed: forum messages, @mentions and tag edits."""
         if self.inbox is None:
             return
-        handlers = {"forum": self._forum_message, "mention": self.mention, "tags": self._pin_from_tags}
+        handlers = {
+            "forum": self._forum_message,
+            "mention": self.mention,
+            "tags": self._pin_from_tags,
+            "press": self.press,
+        }
         for handle, event in self.inbox.pending():
             handler = handlers.get(event.get("kind"))
             try:
@@ -507,11 +615,13 @@ class Bridge:
         link = self._by_thread(thread)
         is_starter = str(message["id"]) == thread
         if link is None and is_starter:
-            await self.adopt({"id": thread, "name": event.get("name")}, starter=message)
+            await self.adopt({"id": thread, "name": event.get("name")}, starter=message, pushed=True)
             return
         if link is None:
+            # The gateway already marked it seen; this post is not synced, so take that back.
+            await self.discord.unreact(thread, message["id"], words.SEEN)
             return
-        await self.receive(link, message)
+        await self.receive(link, message, pushed=True)
         self._advance_cursor(link, message)
 
     def _advance_cursor(self, link, message):
@@ -520,11 +630,11 @@ class Bridge:
         if is_newer:
             self.store.update(link["session"], cursor=str(message["id"]))
 
-    # Commands from Discord
+    # Commands and answers from Discord
 
     async def command(self, link, text):
         runtime = self.runtime[link["session"]]
-        if text == "!stop":
+        if text in {"!stop", "/stop"}:
             await self.rpc.call("session.interrupt", {"session_id": runtime})
             return
         if text == "!unlink":
@@ -532,21 +642,26 @@ class Bridge:
             await self.upsert(link, "unlinked", "sync stopped. the desktop conversation is unchanged.")
             return
         if text.startswith("!approve "):
-            await self._approve(runtime, text)
+            parts = text.split(maxsplit=2)
+            if len(parts) != 3:
+                raise ValueError(USAGE)
+            await self._approve(runtime, parts[1], parts[2], None)
             return
         await self._answer(runtime, text)
 
-    async def _approve(self, runtime, text):
-        parts = text.split(maxsplit=2)
-        if len(parts) != 3:
-            raise ValueError(USAGE)
-        _, rid, choice = parts
+    async def _approve(self, runtime, rid, choice, user):
         request = self._open_request(
             rid, "approval", runtime, "That approval is no longer open in this session"
         )
         if choice not in request["params"].get("choices", []):
             raise ValueError("Choose one of the offered approval options")
-        await self.rpc.call("request.answer", {"id": rid, "result": {"choice": choice}})
+        answered = await self.rpc.call("request.answer", {"id": rid, "result": {"choice": choice}})
+        label = self.words.approval_outcome(choice)
+        if answered.get("status") == "expired":
+            label = self.words.text("platform.discord.approval.expired")
+        elif user:
+            label = self.words.text("platform.discord.approval.by_user", label=label, user=user)
+        await self._settle_request(rid, label)
 
     async def _answer(self, runtime, text):
         parts = text.split(maxsplit=3)
@@ -556,11 +671,13 @@ class Bridge:
         request = self._open_request(
             rid, "clarify", runtime, "That question is no longer open in this session"
         )
-        questions = request["params"]["questions"]
         index = int(number) - 1
-        if not 0 <= index < len(questions):
+        if not 0 <= index < len(request["params"]["questions"]):
             raise ValueError("Question number is out of range")
-        question = questions[index]
+        await self._lock_answer(rid, request, index, answer)
+
+    async def _lock_answer(self, rid, request, index, answer):
+        question = request["params"]["questions"][index]
         choices = question.get("choices") or []
         picked_by_number = answer.isdecimal() and 0 < int(answer) <= len(choices)
         if picked_by_number:
@@ -571,6 +688,39 @@ class Bridge:
         request.setdefault("answers", {})[question["qid"]] = answer
         if locked.get("remaining") == 0:
             await self.rpc.call("request.answer", {"id": rid, "result": {"answers": request["answers"]}})
+            await self._settle_request(rid, None)
+            return
+        await self._show_request_body(request)
+
+    async def _answer_by_reply(self, link, text):
+        """A plain reply answers the open prompt, as with the native bot. False when none is open."""
+        runtime = self.runtime[link["session"]]
+        open_requests = [
+            frame for frame in self.requests.values() if frame["params"].get("session_id") == runtime
+        ]
+        if not open_requests or not text:
+            return False
+        request = open_requests[-1]
+        rid = str(request["id"])
+        if request["method"] == "clarify":
+            await self._lock_answer(rid, request, self._next_question(request), text)
+            return True
+        lowered = text.lower()
+        choices = request["params"].get("choices", [])
+        if lowered in APPROVE_WORDS and "once" in choices:
+            await self._approve(runtime, rid, "once", None)
+            return True
+        if lowered in DENY_WORDS and "deny" in choices:
+            await self._approve(runtime, rid, "deny", None)
+            return True
+        # Anything else is conversation; it goes to the agent like any other message.
+        return False
+
+    @staticmethod
+    def _next_question(request):
+        answered = request.get("answers", {})
+        questions = request["params"]["questions"]
+        return next((index for index, q in enumerate(questions) if q["qid"] not in answered), 0)
 
     def _open_request(self, rid, method, runtime, missing):
         request = self.requests.get(rid)
@@ -581,7 +731,28 @@ class Bridge:
             raise ValueError(missing)
         return request
 
-    # Backend events
+    async def press(self, event):
+        """A button press the gateway acknowledged: an approval choice or a clarify option."""
+        if str(event.get("user")) not in self.allowed_users:
+            return
+        parts = str(event.get("custom_id", "")).removeprefix(BUTTON_PREFIX).split(":")
+        rid = parts[1] if len(parts) > 1 else ""
+        request = self.requests.get(rid)
+        if request is None:
+            return
+        runtime = request["params"]["session_id"]
+        name = event.get("name") or None
+        if parts[0] == "approve" and len(parts) == 3:
+            await self._approve(runtime, rid, parts[2], name)
+            return
+        if parts[0] == "answer" and len(parts) == 4 and parts[2].isdecimal() and parts[3].isdecimal():
+            index = int(parts[2])
+            choices = request["params"]["questions"][index].get("choices") or []
+            choice = int(parts[3])
+            if choice < len(choices):
+                await self._lock_answer(rid, request, index, choices[choice])
+
+    # Prompts the agent is waiting on
 
     async def show_request(self, frame):
         rid = str(frame.get("id", ""))
@@ -590,14 +761,74 @@ class Bridge:
         if link is None or not rid:
             return
         self.requests[rid] = frame
+        await self._show_request_body(frame)
+
+    async def _show_request_body(self, frame, outcome=None):
+        rid = str(frame["id"])
+        params = frame["params"]
+        link = self._by_runtime(params.get("session_id"))
+        if link is None:
+            return
         method = frame["method"]
         if method == "approval":
-            body = _approval_text(rid, params)
+            body, buttons = self._approval_card(rid, params, outcome)
         elif method == "clarify":
-            body = _clarify_text(rid, params)
+            body, buttons = self._clarify_card(rid, params, frame.get("answers", {}), outcome)
         else:
-            body = f"{method} {DESKTOP_ONLY}"
-        await self.upsert(link, f"request:{rid}", body)
+            body, buttons = f"{method} {DESKTOP_ONLY}", []
+        await self.upsert(link, f"request:{rid}", body, _rows(buttons))
+
+    def _approval_card(self, rid, params, outcome):
+        lines = [f"⚠️ **{self.words.text('gateway.exec_approval.header')}**"]
+        if params.get("command"):
+            lines.append(f"```\n{params['command']}\n```")
+        if params.get("description"):
+            lines.append(params["description"])
+        if outcome:
+            lines.append(f"**{outcome}**")
+        buttons = [
+            _button(
+                self.words.approval_label(choice),
+                self.words.approval_style(choice),
+                f"{BUTTON_PREFIX}approve:{rid}:{choice}",
+                disabled=bool(outcome),
+            )
+            for choice in params.get("choices", [])
+        ]
+        return "\n".join(lines), buttons
+
+    def _clarify_card(self, rid, params, answers, outcome):
+        lines = [f"❓ **{self.words.text('platform.discord.prompt.clarify_title')}**"]
+        buttons = []
+        for index, question in enumerate(params.get("questions", [])):
+            answer = answers.get(question["qid"])
+            lines.append(question["question"] if answer is None else f"~~{question['question']}~~ → {answer}")
+            for number, choice in enumerate(question.get("choices") or []):
+                custom_id = f"{BUTTON_PREFIX}answer:{rid}:{index}:{number}"
+                label = f"{number + 1}. {choice}"
+                buttons.append(_button(label, words.PRIMARY, custom_id, disabled=bool(outcome or answer)))
+        if outcome:
+            lines.append(f"**{outcome}**")
+        else:
+            lines.append(f"-# {self.words.text('platform.discord.prompt.clarify_hint_text')}")
+        return "\n".join(lines), buttons
+
+    async def _settle_request(self, rid, outcome):
+        """Keep the answered card, buttons greyed out, so the thread shows what was decided."""
+        frame = self.requests.pop(rid, None)
+        if frame is None:
+            return
+        if outcome is None:
+            answered = len(frame.get("answers", {}))
+            outcome = "answered" if answered else "closed"
+        await self._show_request_body(frame, outcome)
+
+    async def _expire_requests(self, runtime):
+        for rid, frame in list(self.requests.items()):
+            if frame["params"].get("session_id") == runtime:
+                await self._settle_request(rid, "closed")
+
+    # Backend events
 
     async def event(self, frame):
         method = frame.get("method")
@@ -643,29 +874,50 @@ class Bridge:
     async def _on_message_start(self, link, runtime, payload):
         self.streams[runtime] = ""
         self.working[runtime] = link
+        await self.remove(link, "outcome")
+        # Typing shows at once, not on the next 8 second beat.
+        await self.discord.typing(link["thread"])
 
     async def _on_message_delta(self, link, runtime, payload):
         self.streams[runtime] = self.streams.get(runtime, "") + payload.get("text", "")
 
     async def _on_message_interim(self, link, runtime, payload):
-        await self.reconcile(link)
+        await self._settle_live(link, runtime)
         self.streams[runtime] = ""
-        await self.remove(link, "stream")
 
     async def _on_message_complete(self, link, runtime, payload):
-        await self.reconcile(link)
+        await self._settle_live(link, runtime)
         self.streams.pop(runtime, None)
         self.working.pop(runtime, None)
-        await self.remove(link, "stream")
-        await self.remove(link, "activity")
-        if payload.get("status") in {"error", "interrupted"}:
-            await self.upsert(link, "outcome", payload.get("error") or payload["status"])
+        await self._expire_requests(runtime)
+        status = payload.get("status") or "complete"
+        await self._finish_turn(runtime, status)
+        if status in {"error", "interrupted"}:
+            await self.upsert(link, "outcome", payload.get("error") or status)
 
     async def _on_tool_start(self, link, runtime, payload):
-        await self.upsert(link, "activity", f"working: {payload.get('name', 'tool')}")
+        name = payload.get("name") or "tool"
+        preview = _preview(payload.get("preview") or payload.get("context") or "")
+        line = f"-# {self.words.tool_emoji(name)} {name}" + (f": {preview}" if preview else "")
+        self.activity.setdefault(runtime, []).append(line)
+        self.working[runtime] = link
 
     async def _on_tool_complete(self, link, runtime, payload):
-        await self.remove(link, "activity")
+        pass
+
+    def _live_body(self, runtime):
+        """The message showing a running turn: tool lines since the last reply, then the reply so far."""
+        lines = self.activity.get(runtime, [])
+        hidden = len(lines) - ACTIVITY_LINES
+        shown = ([f"-# +{hidden} earlier"] if hidden > 0 else []) + lines[-ACTIVITY_LINES:]
+        text = self.streams.get(runtime, "")
+        return "\n".join(shown + ([text] if text else [])).strip()
+
+    async def _settle_live(self, link, runtime):
+        """The live message becomes the finished reply in place; without one, it goes away."""
+        self.activity.pop(runtime, None)
+        await self.reconcile(link, adopt_stream=True)
+        await self.remove(link, "stream")
 
     async def _on_title(self, link, runtime, payload):
         title = payload.get("title")
@@ -728,10 +980,11 @@ class Bridge:
     async def _flush_streams(self):
         if not self.stream_cadence.due():
             return
-        for runtime, text in list(self.streams.items()):
+        for runtime in list({*self.streams, *self.activity}):
             link = self._by_runtime(runtime)
-            if link and text:
-                await self.upsert(link, "stream", text)
+            body = self._live_body(runtime)
+            if link and body:
+                await self.upsert(link, "stream", body)
 
     async def _keep_typing(self):
         if not self.typing_cadence.due():
@@ -794,6 +1047,9 @@ class Bridge:
         self.streams.clear()
         self.working.clear()
         self.last_seq.clear()
+        self.owner.clear()
+        self.waiting.clear()
+        self.activity.clear()
         async with self.lock:
             for link in self.store.links():
                 await self.attach(link)
