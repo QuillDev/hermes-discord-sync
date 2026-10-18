@@ -1,0 +1,6 @@
+name: discord-sync
+version: 0.1.0
+description: Live two-way sync between Hermes Desktop sessions and Discord forum posts.
+author: QuillDev
+python_dependencies:
+  - aiohttp>=3.12,<4
