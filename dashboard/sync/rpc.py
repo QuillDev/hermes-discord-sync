@@ -9,6 +9,14 @@ import uuid
 
 import aiohttp
 
+# Desktop's keepalive (apps/shared json-rpc-channel): an app-level `gateway.ping`
+# every 15 seconds, and the link counts as dead only after 45 seconds of silence.
+# The backend answers it from its read loop, so an agent turn holding the GIL for
+# a few seconds never looks like a dead socket. A WebSocket-level heartbeat drops
+# the link after a 7.5 second stall, and every reconnect re-attaches every post.
+PING_EVERY = 15
+SILENCE_LIMIT = 45
+
 
 class RpcError(RuntimeError):
     def __init__(self, error):
@@ -17,26 +25,45 @@ class RpcError(RuntimeError):
 
 
 class Rpc:
-    def __init__(self, http, url):
+    def __init__(self, http, url, *, ping_every=PING_EVERY, silence_limit=SILENCE_LIMIT):
         self.http = http
         self.url = url
+        self.ping_every = ping_every
+        self.silence_limit = silence_limit
         self.pending = {}
         self.events = asyncio.Queue(maxsize=10000)
         self.ws = None
         self.reader = None
+        self.keepalive = None
+        self.heard_at = 0.0
 
     async def connect(self):
         self.ws = await self.http.ws_connect(
-            self.url() if callable(self.url) else self.url, max_msg_size=64 * 1024 * 1024, heartbeat=15
+            self.url() if callable(self.url) else self.url, max_msg_size=64 * 1024 * 1024
         )
+        self.heard_at = asyncio.get_running_loop().time()
         self.reader = asyncio.create_task(self._read())
+        self.keepalive = asyncio.create_task(self._keep_alive(self.ws))
         await self.call("client.capabilities", {"server_requests": True})
+
+    async def _keep_alive(self, ws):
+        loop = asyncio.get_running_loop()
+        while not ws.closed:
+            await asyncio.sleep(self.ping_every)
+            if loop.time() - self.heard_at > self.silence_limit:
+                # Closing ends the reader, which reports the disconnect.
+                await ws.close()
+                return
+            ping = {"jsonrpc": "2.0", "id": f"ping-{uuid.uuid4().hex}", "method": "gateway.ping"}
+            with contextlib.suppress(ConnectionError, RuntimeError):
+                await ws.send_json(ping)
 
     async def _read(self):
         try:
             async for message in self.ws:
                 if message.type != aiohttp.WSMsgType.TEXT:
                     continue
+                self.heard_at = asyncio.get_running_loop().time()
                 for line in message.data.splitlines():
                     frame = json.loads(line)
                     if "method" in frame:
@@ -70,7 +97,9 @@ class Rpc:
     async def close(self):
         if self.ws is not None:
             await self.ws.close()
-        if self.reader is not None:
-            self.reader.cancel()
+        for task in (self.keepalive, self.reader):
+            if task is None:
+                continue
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self.reader
+                await task

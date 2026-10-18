@@ -4,6 +4,7 @@ import json
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import aiohttp
 import pytest_asyncio
@@ -32,6 +33,11 @@ class ExternalServices:
         self.sessions = []
         self.forum_tags = []
         self.typing = []
+        # The bot's reactions: (channel, message id) -> emoji, in the order they were added.
+        self.reactions = {}
+        self.busy_status = None
+        self.questions = {}
+        self.locked = {}
 
     def add_post(self, name, content, user="42", parent="forum"):
         # Discord forum posts: the starter message id equals the thread id.
@@ -125,6 +131,12 @@ class ExternalServices:
             elif method == "prompt.submit":
                 assert params["session_id"] == "live-one" or params["session_id"].startswith("live-stored")
                 self.submits += 1
+                if self.busy_status is not None:
+                    # A turn is running: the backend steers or queues instead of starting one.
+                    self.turns.append(params["text"])
+                    result = {"status": self.busy_status}
+                    await socket.send_json({"jsonrpc": "2.0", "id": frame["id"], "result": result})
+                    continue
                 row_id = len(self.rows) + 1
                 self.rows.append({"row_id": row_id, "role": "user", "text": params["text"]})
                 self.turns.append(params["text"])
@@ -137,15 +149,23 @@ class ExternalServices:
                 result = {"interrupted": True}
                 await self.event("message.complete", {"status": "interrupted", "text": ""})
             elif method == "request.answer":
-                self.answers[params["id"]] = params["result"]
-                result = {"status": "ok"}
+                expired = params["id"] in self.answers
+                self.answers.setdefault(params["id"], params["result"])
+                result = {"status": "expired" if expired else "ok"}
             elif method == "clarify.lock":
-                result = {"status": "ok", "remaining": 0}
+                # A batch clarify resolves once every question has an answer.
+                qids = self.questions.get(params["request_id"], [params["question_id"]])
+                locked = self.locked.setdefault(params["request_id"], set())
+                locked.add(params["question_id"])
+                result = {"status": "ok", "remaining": len([q for q in qids if q not in locked])}
             else:
                 await socket.send_json({"id": frame["id"], "error": {"code": -32601, "message": method}})
                 continue
             await socket.send_json({"jsonrpc": "2.0", "id": frame["id"], "result": result})
         return socket
+
+    def reacted(self, channel, mid):
+        return self.reactions.get((str(channel), str(mid)), [])
 
     async def discord(self, request):
         path = ["forum" if part == "555" else part for part in request.match_info["tail"].split("/")]
@@ -176,6 +196,14 @@ class ExternalServices:
         if len(path) == 3 and path[2] == "typing":
             self.typing.append(channel)
             return web.Response(status=204)
+        if len(path) == 7 and path[4] == "reactions":
+            emoji = unquote(request.match_info["tail"].split("/")[5])
+            mine = self.reactions.setdefault((channel, path[3]), [])
+            if method == "PUT" and emoji not in mine:
+                mine.append(emoji)
+            if method == "DELETE" and emoji in mine:
+                mine.remove(emoji)
+            return web.Response(status=204)
         thread = self.threads.setdefault(
             channel, {"name": channel, "messages": [], "archived": False, "parent_id": "text"}
         )
@@ -200,7 +228,7 @@ class ExternalServices:
             nonce = body["nonce"]
             if nonce in self.nonces:
                 return web.json_response(self.nonces[nonce])
-            sent = self.add_message(channel, body["content"], "bot")
+            sent = self.add_message(channel, body["content"], "bot", components=body.get("components", []))
             sent["reply_to"] = (body.get("message_reference") or {}).get("message_id")
             self.nonces[nonce] = sent
             return web.json_response(sent)
@@ -210,7 +238,10 @@ class ExternalServices:
         if method == "GET":
             return web.json_response(message)
         if method == "PATCH":
-            message["content"] = (await request.json())["content"]
+            body = await request.json()
+            message["content"] = body["content"]
+            if "components" in body:
+                message["components"] = body["components"]
             return web.json_response(message)
         if method == "DELETE":
             thread["messages"].remove(message)

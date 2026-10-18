@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+from urllib.parse import quote
 
 import aiohttp
 
@@ -106,18 +107,29 @@ class Discord:
         with contextlib.suppress(DiscordError, aiohttp.ClientError):
             await self.request("POST", f"/channels/{channel}/typing", missing_ok=True)
 
-    async def reply(self, channel, mid, text):
+    async def reply(self, channel, mid, text, *, key=None):
         return await self.request(
             "POST",
             f"/channels/{channel}/messages",
             body={
                 "content": text,
                 "allowed_mentions": NO_MENTIONS,
-                "nonce": _nonce(f"reply:{mid}"),
+                "nonce": _nonce(key or f"reply:{mid}"),
                 "enforce_nonce": True,
                 "message_reference": {"message_id": str(mid), "fail_if_not_exists": False},
             },
         )
+
+    async def react(self, channel, mid, emoji):
+        # Cosmetic, like typing: a missing message or a refused reaction never fails a turn.
+        path = f"/channels/{channel}/messages/{mid}/reactions/{quote(emoji)}/@me"
+        with contextlib.suppress(DiscordError, aiohttp.ClientError):
+            await self.request("PUT", path, missing_ok=True)
+
+    async def unreact(self, channel, mid, emoji):
+        path = f"/channels/{channel}/messages/{mid}/reactions/{quote(emoji)}/@me"
+        with contextlib.suppress(DiscordError, aiohttp.ClientError):
+            await self.request("DELETE", path, missing_ok=True)
 
     async def ensure_tag(self, forum, name):
         channel = await self.request("GET", f"/channels/{forum}")
@@ -160,25 +172,17 @@ class Discord:
             before = min(batch, key=lambda message: int(message["id"]))["id"]
         return sorted(collected, key=lambda message: int(message["id"]))
 
-    async def send(self, thread, text, *, key):
-        return await self.request(
-            "POST",
-            f"/channels/{thread}/messages",
-            body={
-                "content": text,
-                "allowed_mentions": NO_MENTIONS,
-                "nonce": _nonce(key),
-                "enforce_nonce": True,
-            },
-        )
+    async def send(self, thread, text, *, key, components=None):
+        body = {"content": text, "allowed_mentions": NO_MENTIONS, "nonce": _nonce(key), "enforce_nonce": True}
+        if components is not None:
+            body["components"] = components
+        return await self.request("POST", f"/channels/{thread}/messages", body=body)
 
-    async def edit(self, thread, mid, text):
-        return await self.request(
-            "PATCH",
-            f"/channels/{thread}/messages/{mid}",
-            body={"content": text, "allowed_mentions": NO_MENTIONS},
-            missing_ok=True,
-        )
+    async def edit(self, thread, mid, text, *, components=None):
+        body = {"content": text, "allowed_mentions": NO_MENTIONS}
+        if components is not None:
+            body["components"] = components
+        return await self.request("PATCH", f"/channels/{thread}/messages/{mid}", body=body, missing_ok=True)
 
     async def delete(self, thread, mid):
         await self.request("DELETE", f"/channels/{thread}/messages/{mid}", missing_ok=True)
