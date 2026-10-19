@@ -686,11 +686,17 @@ class Bridge:
             "clarify.lock", {"request_id": rid, "question_id": question["qid"], "answer": answer}
         )
         request.setdefault("answers", {})[question["qid"]] = answer
+        if locked.get("status") == "expired":
+            # Answered elsewhere (Desktop) or timed out; the gateway sends no cancel for the former.
+            request["answers"].pop(question["qid"])
+            await self._settle_request(rid, "closed")
+            return False
         if locked.get("remaining") == 0:
             await self.rpc.call("request.answer", {"id": rid, "result": {"answers": request["answers"]}})
             await self._settle_request(rid, None)
-            return
+            return True
         await self._show_request_body(request)
+        return True
 
     async def _answer_by_reply(self, link, text):
         """A plain reply answers the open prompt, as with the native bot. False when none is open."""
@@ -703,8 +709,8 @@ class Bridge:
         request = open_requests[-1]
         rid = str(request["id"])
         if request["method"] == "clarify":
-            await self._lock_answer(rid, request, self._next_question(request), text)
-            return True
+            # A closed question must not swallow the reply; it goes to the agent instead.
+            return await self._lock_answer(rid, request, self._next_question(request), text)
         lowered = text.lower()
         choices = request["params"].get("choices", [])
         if lowered in APPROVE_WORDS and "once" in choices:

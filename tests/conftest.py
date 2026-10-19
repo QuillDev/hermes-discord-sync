@@ -38,6 +38,8 @@ class ExternalServices:
         self.busy_status = None
         self.questions = {}
         self.locked = {}
+        # Requests the host already settled, e.g. answered from Desktop.
+        self.settled = set()
 
     def add_post(self, name, content, user="42", parent="forum"):
         # Discord forum posts: the starter message id equals the thread id.
@@ -152,6 +154,8 @@ class ExternalServices:
                 expired = params["id"] in self.answers
                 self.answers.setdefault(params["id"], params["result"])
                 result = {"status": "expired" if expired else "ok"}
+            elif method == "clarify.lock" and params["request_id"] in self.settled:
+                result = {"status": "expired"}
             elif method == "clarify.lock":
                 # A batch clarify resolves once every question has an answer.
                 qids = self.questions.get(params["request_id"], [params["question_id"]])
