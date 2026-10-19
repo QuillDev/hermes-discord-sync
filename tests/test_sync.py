@@ -583,3 +583,83 @@ async def test_the_gateway_yields_the_sync_forum_and_mentions_only_while_the_bri
         dispose()
     await bot.on_message(message("after unload", 123))
     assert answered_by_gateway[-1] == "after unload"
+
+
+async def test_each_post_is_tagged_with_where_it_stands(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    thread = link["thread"]
+    world.pins.set("session-one", True)
+    await bridge.receive(link, external.add_message(thread, "build it"))
+    await through(bridge, "message.start")
+    await bridge.tick()
+    assert external.tag_names(thread) == ["pinned", "working"]
+    approval = {"session_id": "live-one", "command": "deploy", "choices": ["once", "deny"]}
+    await bridge.show_request({"id": "srq-1", "method": "approval", "params": approval})
+    await bridge.tick()
+    assert external.tag_names(thread) == ["needs you", "pinned"]
+    await bridge.receive(link, external.add_message(thread, "yes"))
+    await bridge.tick()
+    assert external.tag_names(thread) == ["pinned", "working"]
+    external.rows.append({"row_id": 9, "role": "assistant", "text": "deployed"})
+    await external.event("message.complete", {"status": "complete", "text": "deployed"})
+    await through(bridge, "message.complete")
+    await bridge.tick()
+    assert external.tag_names(thread) == ["done", "pinned"]
+
+
+async def test_a_failed_turn_and_a_turn_running_at_reconnect_are_tagged_once_settled(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    thread = link["thread"]
+    await external.event("message.start")
+    await through(bridge, "message.start")
+    await bridge.tick()
+    assert external.tag_names(thread) == ["working"]
+    await external.event("message.complete", {"status": "error", "error": "boom"})
+    await through(bridge, "message.complete")
+    await bridge.tick()
+    assert external.tag_names(thread) == ["needs you"]
+    # A finish missed while disconnected must not leave the post "working" forever.
+    external.rows.append({"row_id": 1, "role": "assistant", "text": "half done"})
+    await external.event("message.start")
+    await through(bridge, "message.start")
+    await bridge.tick()
+    await bridge._connect()
+    await bridge.tick()
+    assert external.tag_names(thread) == ["done"]
+
+
+async def test_you_are_pinged_when_something_needs_you_or_your_discord_turn_finishes(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    thread = link["thread"]
+
+    def pings():
+        return [(message["content"], message["notifies"]) for message in external.notified(thread)]
+
+    await bridge.receive(link, external.add_message(thread, "build it"))
+    await through(bridge, "message.start")
+    approval = {"session_id": "live-one", "command": "deploy", "choices": ["once", "deny"]}
+    await bridge.show_request({"id": "srq-1", "method": "approval", "params": approval})
+    assert pings() == [("<@42> needs your ok", ["42"])]
+    # The card shown again after a reconnect does not ping twice.
+    await bridge.show_request({"id": "srq-1", "method": "approval", "params": approval})
+    assert len(pings()) == 1
+    # Answered: the ping goes away with the need.
+    await bridge.receive(link, external.add_message(thread, "yes"))
+    assert pings() == []
+    external.rows.append({"row_id": 9, "role": "assistant", "text": "deployed"})
+    await external.event("message.complete", {"status": "complete", "text": "deployed"})
+    await through(bridge, "message.complete")
+    assert pings() == [("<@42> done", ["42"])]
+    # A turn started at the desktop clears the old ping and finishes quietly.
+    await external.event("message.start")
+    await through(bridge, "message.start")
+    assert pings() == []
+    await external.event("message.complete", {"status": "complete", "text": ""})
+    await through(bridge, "message.complete")
+    assert pings() == []
+    # A failure pings whoever started the turn.
+    await external.event("message.start")
+    await through(bridge, "message.start")
+    await external.event("message.complete", {"status": "error", "error": "boom"})
+    await through(bridge, "message.complete")
+    assert pings() == [("<@42> hit an error", ["42"])]
