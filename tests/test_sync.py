@@ -663,3 +663,73 @@ async def test_you_are_pinged_when_something_needs_you_or_your_discord_turn_fini
     await external.event("message.complete", {"status": "error", "error": "boom"})
     await through(bridge, "message.complete")
     assert pings() == [("<@42> hit an error", ["42"])]
+
+
+@pytest.mark.skipif(not HERMES_AGENT.is_dir(), reason="needs a Hermes Agent checkout (HERMES_AGENT_DIR)")
+async def test_a_multiplexed_gateway_still_hands_allowed_mentions_to_the_bridge(tmp_path, monkeypatch):
+    sys.path.insert(0, str(HERMES_AGENT))
+    from agent.secret_scope import reset_multiplex_context, set_multiplex_context
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    (tmp_path / ".env").write_text("DISCORD_ALLOWED_USERS=217\n")
+    spec = importlib.util.spec_from_file_location(
+        "sync_plugin_multiplexed", PLUGIN_ROOT / "__init__.py", submodule_search_locations=[str(PLUGIN_ROOT)]
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = plugin
+    spec.loader.exec_module(plugin)
+    installers = []
+    plugin.register(
+        SimpleNamespace(
+            get_config=lambda key, default: "123",
+            on_unload=lambda dispose: None,
+            register_platform_handler=lambda platform, install: installers.append(install),
+        )
+    )
+    answered_by_gateway = []
+
+    class NativeBot:
+        user = SimpleNamespace(id=42)
+
+        async def on_message(self, message):
+            answered_by_gateway.append(message.content)
+
+        def event(self, handler):
+            setattr(self, handler.__name__, handler)
+            return handler
+
+    class TextChannel(SimpleNamespace):
+        pass
+
+    async def add_reaction(emoji):
+        pass
+
+    def mention(content, author):
+        return SimpleNamespace(
+            channel=TextChannel(id=77, parent_id=None),
+            content=content,
+            id=5,
+            author=SimpleNamespace(id=author, bot=False),
+            mentions=[bot.user],
+            guild=object(),
+            webhook_id=None,
+            attachments=[],
+            add_reaction=add_reaction,
+        )
+
+    bot = NativeBot()
+    installers[0](bot, None)
+    beat = tmp_path / "discord-sync" / "heartbeat"
+    beat.parent.mkdir()
+    beat.touch()
+    token = set_multiplex_context(True)
+    try:
+        await bot.on_message(mention("<@42> from quill", "217"))
+        await bot.on_message(mention("<@42> from a stranger", "99"))
+    finally:
+        reset_multiplex_context(token)
+    inbox = Inbox(tmp_path / "discord-sync" / "inbox")
+    pushed = [event["message"]["content"] for _, event in inbox.pending()]
+    assert pushed == ["<@42> from quill"]
+    assert answered_by_gateway == ["<@42> from a stranger"]
