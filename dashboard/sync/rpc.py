@@ -38,6 +38,9 @@ class Rpc:
         self.heard_at = 0.0
 
     async def connect(self):
+        # A fresh queue per link: closing the previous link queued its own
+        # disconnect, and reading that here would drop this link at once.
+        self.events = asyncio.Queue(maxsize=10000)
         self.ws = await self.http.ws_connect(
             self.url() if callable(self.url) else self.url, max_msg_size=64 * 1024 * 1024
         )

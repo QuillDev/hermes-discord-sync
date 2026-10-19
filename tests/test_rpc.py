@@ -2,6 +2,7 @@ import asyncio
 import json
 
 import aiohttp
+import pytest
 from aiohttp import web
 from conftest import serving
 
@@ -47,5 +48,21 @@ async def test_a_silent_backend_is_reported_disconnected():
         try:
             frame = await asyncio.wait_for(rpc.events.get(), 2)
             assert frame == {"method": "bridge.disconnected"}
+        finally:
+            await rpc.close()
+
+
+async def test_a_reconnected_backend_is_not_reported_disconnected_by_the_previous_link():
+    # A link closed after some other failure (an RPC timeout, a Discord error)
+    # must not leave its disconnect behind for the next link to read.
+    async with serving(backend(answers_pings=True)) as base, aiohttp.ClientSession() as http:
+        rpc = Rpc(http, base + "/api/ws")
+        await rpc.connect()
+        await rpc.close()
+        await rpc.connect()
+        try:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(rpc.events.get(), 0.5)
+            assert not rpc.ws.closed
         finally:
             await rpc.close()
