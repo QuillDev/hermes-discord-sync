@@ -172,6 +172,19 @@ async def test_clarify_options_are_buttons_and_a_typed_reply_answers_the_next_qu
     assert external.turns == []
 
 
+async def test_a_reply_after_the_question_was_answered_elsewhere_reaches_the_agent(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    clarify = {"session_id": "live-one", "questions": [{"qid": "q1", "question": "which?", "choices": ["a"]}]}
+    await bridge.show_request({"id": "srq-4", "method": "clarify", "params": clarify})
+    # Desktop answered it; the host sends no cancel for that.
+    external.settled.add("srq-4")
+    await bridge.receive(link, external.add_message(link["thread"], "are you there?"))
+    assert external.turns == ["are you there?"]
+    prompt = card(external, link["thread"], "which?")
+    assert "closed" in prompt["content"]
+    assert "are you there?" not in prompt["content"]
+
+
 async def test_a_cancelled_request_disappears_and_its_command_reports_it_closed(world):
     bridge, external, link = world.bridge, world.external, world.link
     clarify = {"session_id": "live-one", "questions": [{"qid": "q1", "question": "which?", "choices": ["a"]}]}
