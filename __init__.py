@@ -36,9 +36,15 @@ def _push(event):
 
 
 def _allowed_users():
-    from agent.secret_scope import get_secret
+    from agent.secret_scope import UnscopedSecretError, build_profile_secret_scope, get_secret
+    from hermes_constants import get_hermes_home
 
-    raw = get_secret("DISCORD_ALLOWED_USERS") or ""
+    try:
+        raw = get_secret("DISCORD_ALLOWED_USERS") or ""
+    except UnscopedSecretError:
+        # Discord events arrive outside any turn, so a multiplexed gateway has
+        # no profile scope installed; read this profile's own secrets instead.
+        raw = build_profile_secret_scope(get_hermes_home()).get("DISCORD_ALLOWED_USERS") or ""
     return {user.strip() for user in raw.split(",") if user.strip().isdecimal()}
 
 
