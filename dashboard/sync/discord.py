@@ -143,12 +143,14 @@ class Discord:
         )
         return next(tag["id"] for tag in updated["available_tags"] if tag["name"] == name)
 
-    async def set_tag(self, thread, tag, on):
+    async def retag(self, thread, managed, wanted):
+        """Swap the managed tags on a post for the wanted ones; tags someone else added stay."""
         channel = await self.request("GET", f"/channels/{thread}")
-        tags = [applied for applied in channel.get("applied_tags", []) if applied != tag]
-        if on:
-            tags.append(tag)
-        await self.request("PATCH", f"/channels/{thread}", body={"applied_tags": tags[:MAX_TAGS]})
+        applied = channel.get("applied_tags", [])
+        kept = [tag for tag in applied if tag not in managed and tag not in wanted]
+        tags = [*wanted, *kept][:MAX_TAGS]
+        if set(tags) != set(applied):
+            await self.request("PATCH", f"/channels/{thread}", body={"applied_tags": tags})
 
     async def active_threads(self):
         found = await self.request("GET", f"/guilds/{self.guild}/threads/active")
@@ -172,8 +174,10 @@ class Discord:
             before = min(batch, key=lambda message: int(message["id"]))["id"]
         return sorted(collected, key=lambda message: int(message["id"]))
 
-    async def send(self, thread, text, *, key, components=None):
-        body = {"content": text, "allowed_mentions": NO_MENTIONS, "nonce": _nonce(key), "enforce_nonce": True}
+    async def send(self, thread, text, *, key, components=None, ping=()):
+        # Only the users named in `ping` are notified; every other mention stays inert.
+        mentions = {**NO_MENTIONS, "users": list(ping)} if ping else NO_MENTIONS
+        body = {"content": text, "allowed_mentions": mentions, "nonce": _nonce(key), "enforce_nonce": True}
         if components is not None:
             body["components"] = components
         return await self.request("POST", f"/channels/{thread}/messages", body=body)

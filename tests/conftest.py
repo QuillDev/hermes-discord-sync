@@ -168,6 +168,14 @@ class ExternalServices:
             await socket.send_json({"jsonrpc": "2.0", "id": frame["id"], "result": result})
         return socket
 
+    def notified(self, thread):
+        """Bot messages that notify someone, oldest first."""
+        return [message for message in self.threads[thread]["messages"] if message.get("notifies")]
+
+    def tag_names(self, thread):
+        names = {tag["id"]: tag["name"] for tag in self.forum_tags}
+        return sorted(names[tag] for tag in self.threads[thread].get("applied_tags", []))
+
     def reacted(self, channel, mid):
         return self.reactions.get((str(channel), str(mid)), [])
 
@@ -228,11 +236,14 @@ class ExternalServices:
             return web.json_response(sorted(messages, key=lambda m: int(m["id"]), reverse=True)[:100])
         if len(path) == 3 and method == "POST":
             body = await request.json()
-            assert body["allowed_mentions"] == {"parse": []}
+            # Nothing mass-pings; only explicitly listed users are notified.
+            mentions = body["allowed_mentions"]
+            assert mentions["parse"] == []
             nonce = body["nonce"]
             if nonce in self.nonces:
                 return web.json_response(self.nonces[nonce])
             sent = self.add_message(channel, body["content"], "bot", components=body.get("components", []))
+            sent["notifies"] = mentions.get("users", [])
             sent["reply_to"] = (body.get("message_reference") or {}).get("message_id")
             self.nonces[nonce] = sent
             return web.json_response(sent)

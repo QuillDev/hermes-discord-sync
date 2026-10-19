@@ -26,6 +26,13 @@ DISCORD_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
 DESKTOP_SOURCES = {"desktop", "tui"}
 DEFAULT_TITLE = "discord session"
 PIN_TAG = "pinned"
+# Where each post stands, shown as a tag in the forum list.
+WORKING = "working"
+NEEDS_YOU = "needs you"
+DONE = "done"
+STATUS_TAGS = (WORKING, NEEDS_YOU, DONE)
+TURN_PING = "ping:turn"
+REQUEST_PINGS = {"approval": "needs your ok", "clarify": "has a question"}
 DESKTOP_ONLY = "needs the desktop app. secrets and desktop-only actions are not sent through discord."
 USAGE = "commands: !stop, !unlink, !approve <request> <choice>, !answer <request> <question> <answer>"
 BUTTON_PREFIX = "hds:"
@@ -153,7 +160,7 @@ class Bridge:
         # Posts from before this process started were answered by the normal gateway.
         self.adopt_since = time.time()
         self.ignored_threads = set()
-        self.pin_tag = None
+        self.tag_ids = {}
         self.lock = asyncio.Lock()
         self.connected = False
         self.last_error = None
@@ -175,6 +182,11 @@ class Bridge:
         self.waiting = {}
         # Tool progress lines per running turn, shown above the streamed reply.
         self.activity = {}
+        # Turns a Discord message steered into; their finish pings like a Discord-started turn.
+        self.steered = set()
+        # Stored session id -> how its last turn ended (DONE or NEEDS_YOU), and the status tag on its post.
+        self.finished = {}
+        self.shown_status = {}
 
     # Lookups
 
@@ -212,6 +224,8 @@ class Bridge:
         inflight = snapshot.get("inflight") or {}
         if inflight.get("streaming") and inflight.get("assistant"):
             self.streams[runtime] = inflight["assistant"]
+        if inflight.get("streaming"):
+            self.working[runtime] = link
         replay = await self.rpc.call("session.events.since", {"session_id": runtime, "last_seen": 0})
         # Reconcile durable rows, then start at the snapshot's boundary. A new
         # transport can have already queued some of the same replay frames.
@@ -219,6 +233,10 @@ class Bridge:
         for request in replay.get("open_requests", []):
             await self.show_request(request)
         await self.reconcile(link)
+        has_turns = any(address.startswith("row:") for address in self.store.get_projection(link["session"]))
+        if has_turns:
+            # Whatever ran before this connection has ended; a missed finish must not stay "working".
+            self.finished.setdefault(link["session"], DONE)
 
     async def link(self, session):
         async with self.lock:
@@ -506,6 +524,8 @@ class Bridge:
             self.owner[runtime] = (channel, mid)
             return
         await self._swap(channel, mid, words.SEEN, busy)
+        if outcome in {"steered", "redirected"}:
+            self.steered.add(runtime)
         if outcome == "queued":
             self.waiting.setdefault(runtime, deque()).append((channel, mid))
         ack = self.words.ack(outcome)
@@ -768,6 +788,10 @@ class Bridge:
             return
         self.requests[rid] = frame
         await self._show_request_body(frame)
+        address = f"ping:{rid}"
+        # One ping per request, even when a reconnect shows the card again.
+        if address not in self.store.get_projection(link["session"]):
+            await self._ping(link, address, REQUEST_PINGS.get(frame["method"], "needs the desktop app"))
 
     async def _show_request_body(self, frame, outcome=None):
         rid = str(frame["id"])
@@ -824,6 +848,9 @@ class Bridge:
         frame = self.requests.pop(rid, None)
         if frame is None:
             return
+        link = self._by_runtime(frame["params"].get("session_id"))
+        if link is not None:
+            await self.remove(link, f"ping:{rid}")
         if outcome is None:
             answered = len(frame.get("answers", {}))
             outcome = "answered" if answered else "closed"
@@ -880,7 +907,10 @@ class Bridge:
     async def _on_message_start(self, link, runtime, payload):
         self.streams[runtime] = ""
         self.working[runtime] = link
+        self.finished.pop(link["session"], None)
         await self.remove(link, "outcome")
+        # The last turn's ping is stale once another turn starts.
+        await self.remove(link, TURN_PING)
         # Typing shows at once, not on the next 8 second beat.
         await self.discord.typing(link["thread"])
 
@@ -897,9 +927,17 @@ class Bridge:
         self.working.pop(runtime, None)
         await self._expire_requests(runtime)
         status = payload.get("status") or "complete"
+        from_discord = runtime in self.owner or runtime in self.steered
+        self.steered.discard(runtime)
         await self._finish_turn(runtime, status)
         if status in {"error", "interrupted"}:
             await self.upsert(link, "outcome", payload.get("error") or status)
+        self.finished[link["session"]] = NEEDS_YOU if status == "error" else DONE
+        if status == "error":
+            await self._ping(link, TURN_PING, "hit an error")
+        elif status == "complete" and from_discord:
+            # Desktop-started turns only change the tag: whoever started them is at the desktop.
+            await self._ping(link, TURN_PING, "done")
 
     async def _on_tool_start(self, link, runtime, payload):
         name = payload.get("name") or "tool"
@@ -936,29 +974,65 @@ class Bridge:
         rid = str(payload.get("id") or payload.get("request_id") or "")
         self.requests.pop(rid, None)
         await self.remove(link, f"request:{rid}")
+        await self.remove(link, f"ping:{rid}")
 
     async def _on_error(self, link, runtime, payload):
         await self.upsert(link, "outcome", payload.get("message") or "session error")
+        self.finished[link["session"]] = NEEDS_YOU
+        await self._ping(link, TURN_PING, "hit an error")
 
-    # Pins. Discord allows one pinned post per forum, so a tag stands in.
+    async def _ping(self, link, address, text):
+        """A new message that notifies the allowed users; edits never notify, so it is always fresh."""
+        await self.remove(link, address)
+        users = sorted(self.allowed_users)
+        body = " ".join(f"<@{user}>" for user in users) + f" {text}"
+        key = f"{link['session']}:{address}:{time.time_ns()}"
+        sent = await self.discord.send(link["thread"], body, key=key, ping=users)
+        self.store.project(link["session"], address, [sent["id"]], body)
+
+    # Forum tags: pins (Discord allows one pinned post per forum, so a tag stands in) and status.
+
+    async def _tag(self, name):
+        if name not in self.tag_ids:
+            self.tag_ids[name] = await self.discord.ensure_tag(self.forum, name)
+        return self.tag_ids[name]
 
     async def _pin_tag(self):
-        if self.pin_tag is None:
-            self.pin_tag = await self.discord.ensure_tag(self.forum, PIN_TAG)
-        return self.pin_tag
+        return await self._tag(PIN_TAG)
 
-    async def push_pins(self):
-        """Desktop to Discord: tag the posts of pinned sessions."""
-        if self.pins is None:
-            return
-        tag = await self._pin_tag()
-        pinned = self.pins.pinned()
+    def _status(self, link):
+        """Where a post stands: waiting on the user, running, or how its last turn ended."""
+        runtime = self.runtime.get(link["session"])
+        if runtime is None:
+            return None
+        asking = any(frame["params"].get("session_id") == runtime for frame in self.requests.values())
+        if asking:
+            return NEEDS_YOU
+        if runtime in self.working:
+            return WORKING
+        return self.finished.get(link["session"])
+
+    async def push_tags(self):
+        """Desktop to Discord: tag pinned sessions' posts, and every post with its status."""
+        pinned = None if self.pins is None else self.pins.pinned()
+        pin_tag = None if pinned is None else await self._pin_tag()
         for link in self.store.links():
-            want = link["session"] in pinned
-            if self.store.pin(link["session"]) == want:
+            session = link["session"]
+            was_pinned = self.store.pin(session)
+            pin = was_pinned if pinned is None else session in pinned
+            status = self._status(link)
+            status_changed = status is not None and self.shown_status.get(session) != status
+            if pin == was_pinned and not status_changed:
                 continue
-            await self.discord.set_tag(link["thread"], tag, want)
-            self.store.set_pin(link["session"], want)
+            managed = set() if pin_tag is None else {pin_tag}
+            wanted = [pin_tag] if pin and pin_tag is not None else []
+            if status_changed:
+                managed |= {await self._tag(name) for name in STATUS_TAGS}
+                wanted.append(await self._tag(status))
+            await self.discord.retag(link["thread"], managed, wanted)
+            self.store.set_pin(session, pin)
+            if status_changed:
+                self.shown_status[session] = status
 
     async def _pin_from_tags(self, event):
         """Discord to desktop: adding or removing the tag pins or unpins the session."""
@@ -977,7 +1051,7 @@ class Bridge:
     async def tick(self):
         async with self.lock:
             await self.drain()
-            await self.push_pins()
+            await self.push_tags()
             await self.scan()
             await self._flush_streams()
             await self._keep_typing()
@@ -1056,6 +1130,7 @@ class Bridge:
         self.owner.clear()
         self.waiting.clear()
         self.activity.clear()
+        self.steered.clear()
         async with self.lock:
             for link in self.store.links():
                 await self.attach(link)
