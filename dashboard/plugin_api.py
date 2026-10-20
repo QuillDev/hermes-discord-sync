@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import sqlite3
 import sys
@@ -135,6 +136,25 @@ class HermesPins:
             release_or_close(db)
 
 
+class HermesThreads:
+    """The Discord thread the native gateway routes a session to, from the profile's session database."""
+
+    def __init__(self, home):
+        self.path = home / "state.db"
+
+    def __call__(self, session):
+        with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)) as db:
+            rows = db.execute(
+                "SELECT entry_json FROM gateway_routing WHERE session_key LIKE 'agent:%:discord:thread:%'"
+            ).fetchall()
+        for (entry,) in rows:
+            entry = json.loads(entry)
+            if entry.get("session_id") == session:
+                origin = entry.get("origin") or {}
+                return origin.get("thread_id") or origin.get("chat_id")
+        return None
+
+
 class _Service:
     """Runs the bridge on its own loop thread for the life of the backend."""
 
@@ -194,6 +214,7 @@ class _Service:
                 users,
                 inbox=Inbox(sync_dir / "inbox"),
                 pins=HermesPins(home),
+                threads=HermesThreads(home),
                 notify=_notify,
                 heartbeat=heartbeat.touch,
                 auto_link=bool(entry.get("auto_link", True)),
