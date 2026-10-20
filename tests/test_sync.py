@@ -506,7 +506,7 @@ async def test_a_pushed_forum_reply_runs_once_even_when_the_poll_sees_it_too(wor
 
 
 @pytest.mark.skipif(not HERMES_AGENT.is_dir(), reason="needs a Hermes Agent checkout (HERMES_AGENT_DIR)")
-async def test_the_gateway_yields_the_sync_forum_and_mentions_only_while_the_bridge_is_alive(
+async def test_the_gateway_yields_the_sync_forum_while_the_bridge_is_alive_and_never_threads_a_mention(
     tmp_path, monkeypatch
 ):
     sys.path.insert(0, str(HERMES_AGENT))
@@ -545,9 +545,14 @@ async def test_the_gateway_yields_the_sync_forum_and_mentions_only_while_the_bri
     bot = NativeBot()
     seen = []
 
+    replies = []
+
     def message(content, parent=None, mentions=(), author="217", channel=None):
         async def add_reaction(emoji):
             seen.append((content, emoji))
+
+        async def reply(text, mention_author=True):
+            replies.append((content, text))
 
         return SimpleNamespace(
             channel=channel or SimpleNamespace(parent_id=parent, id=1),
@@ -559,6 +564,7 @@ async def test_the_gateway_yields_the_sync_forum_and_mentions_only_while_the_bri
             webhook_id=None,
             attachments=[],
             add_reaction=add_reaction,
+            reply=reply,
         )
 
     acknowledged = []
@@ -611,6 +617,11 @@ async def test_the_gateway_yields_the_sync_forum_and_mentions_only_while_the_bri
     assert acknowledged == [("defer", "hds:approve:srq-1:once")]
     os.utime(beat, (1, 1))
     await bot.on_message(message("bridge died: gateway answers", 123))
+    # A sync mention never becomes a native thread: it is told the sync is down.
+    await bot.on_message(message("<@42> while down", mentions=[bot.user], channel=text_channel))
+    assert len(replies) == 1
+    assert replies[0][0] == "<@42> while down"
+    assert replies[0][1].startswith("discord sync is offline")
     await bot.on_interaction(press("hds:approve:srq-1:once"))
     assert acknowledged[-1] == ("offline", "hds:approve:srq-1:once")
     assert answered_by_gateway == [

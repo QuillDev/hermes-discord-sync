@@ -53,6 +53,7 @@ POLL_EVERY = 1
 SCAN_EVERY = 30
 SCAN_AFTER_CHANGE = 5
 HEARTBEAT_EVERY = 2
+STALL_WARN_AFTER = 5
 TICK_EVERY = 0.25
 
 
@@ -1112,9 +1113,15 @@ class Bridge:
     async def beat(self):
         # Separate from the tick so a slow Discord pass never lets the gateway
         # reservation lapse and the normal bot answer a synced post twice.
+        last = time.monotonic()
         while True:
             self.heartbeat()
             await asyncio.sleep(HEARTBEAT_EVERY)
+            now = time.monotonic()
+            if now - last > HEARTBEAT_EVERY + STALL_WARN_AFTER:
+                # Something blocked the loop; past 20s the gateway stops handing work over.
+                log.warning("Discord sync loop stalled %.1fs between heartbeats", now - last - HEARTBEAT_EVERY)
+            last = now
 
     async def serve(self):
         delay = 1
