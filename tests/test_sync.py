@@ -226,6 +226,30 @@ async def test_message_status_shows_as_reactions_like_the_native_bot(world):
     assert external.reacted(thread, queued["id"]) == ["⏹️"]
 
 
+async def test_a_reply_to_a_redirect_lands_below_the_redirecting_message(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    thread = link["thread"]
+    await external.event("message.start")
+    await through(bridge, "message.start")
+    await external.event("tool.start", {"name": "web_search", "preview": "contabo plans"})
+    await through(bridge, "tool.start")
+    await bridge.tick()
+    assert any("web_search" in body for body in bodies(external, thread))
+    external.busy_status = "redirected"
+    redirect = external.add_message(thread, "are contabo vds shared?")
+    await bridge.receive(link, redirect)
+    await external.event("message.delta", {"text": "no, mostly not."})
+    await through(bridge, "message.delta")
+    world.clock.advance(STREAM_EDIT_EVERY)
+    await bridge.tick()
+    external.rows.append({"row_id": 7, "role": "assistant", "text": "no, mostly not."})
+    await external.event("message.complete", {"status": "complete", "text": "no, mostly not."})
+    await through(bridge, "message.complete")
+    shown = bodies(external, thread)
+    assert shown.count("no, mostly not.") == 1
+    assert shown.index("no, mostly not.") > shown.index("are contabo vds shared?")
+
+
 async def test_a_rejected_message_gets_a_failure_reaction(world):
     bridge, external, link = world.bridge, world.external, world.link
     attachment = {"url": "http://127.0.0.1:9119/x", "size": 1, "filename": "x"}

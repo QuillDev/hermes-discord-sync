@@ -526,6 +526,9 @@ class Bridge:
         await self._swap(channel, mid, words.SEEN, busy)
         if outcome in {"steered", "redirected"}:
             self.steered.add(runtime)
+            # The run now answers this message, so its live message moves below it:
+            # the next flush posts it fresh instead of editing the one above.
+            await self.remove(link, "stream")
         if outcome == "queued":
             self.waiting.setdefault(runtime, deque()).append((channel, mid))
         ack = self.words.ack(outcome)
