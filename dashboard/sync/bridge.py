@@ -21,6 +21,8 @@ log = logging.getLogger("hermes.discord-sync")
 
 MEDIA = re.compile(r"(?m)^MEDIA:(/[^\r\n]+)$")
 MENTION = re.compile(r"<@!?\d+>")
+# A Hermes session reference, optionally `code`-wrapped: @session:<profile>/<id> or @session:<id>.
+SESSION_REF = re.compile(r"`?@session:(?:[\w.-]+/)?(\d{8}_\d{6}_[0-9a-f]+)`?")
 MAX_FILE = 10 * 1024 * 1024
 DISCORD_HOSTS = {"cdn.discordapp.com", "media.discordapp.net"}
 DESKTOP_SOURCES = {"desktop", "tui"}
@@ -133,6 +135,7 @@ class Bridge:
         inbox=None,
         pins=None,
         notify=None,
+        threads=None,
         guard=None,
         heartbeat=None,
         auto_link=True,
@@ -150,6 +153,8 @@ class Bridge:
         self.inbox = inbox
         self.pins = pins
         self.notify = notify or (lambda session: None)
+        # Session id -> the Discord thread the native gateway answers it in, if any.
+        self.threads = threads or (lambda session: None)
         self.guard = guard or (lambda: True)
         self.heartbeat = heartbeat or (lambda: None)
         self.auto_link = auto_link
@@ -357,7 +362,21 @@ class Bridge:
 
     # Writing to Discord
 
+    def _thread_of(self, session):
+        link = self._by_session(session)
+        return link["thread"] if link else self.threads(session)
+
+    def _link_sessions(self, body):
+        """Session references become thread links when the session has a Discord thread."""
+
+        def replace(match):
+            thread = self._thread_of(match.group(1))
+            return f"<#{thread}>" if thread else match.group(0)
+
+        return SESSION_REF.sub(replace, body)
+
     async def upsert(self, link, address, body, components=None):
+        body = self._link_sessions(body)
         # Buttons are part of what is shown: a change to them alone is an edit too.
         shown = body if components is None else body + "\x00" + json.dumps(components)
         projection = self.store.get_projection(link["session"]).get(address)

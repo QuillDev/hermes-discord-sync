@@ -317,8 +317,20 @@ async def world(tmp_path):
         inbox = Inbox(tmp_path / "sync" / "inbox")
         pins = FakePins()
         clock = FakeClock()
+        # Sessions the native gateway answers in a Discord thread: session id -> thread id.
+        native_threads = {}
         discord = Discord(http, "test-token", base + "/discord")
-        bridge = Bridge(rpc, discord, store, "forum", ["42"], inbox=inbox, pins=pins, clock=clock)
+        bridge = Bridge(
+            rpc,
+            discord,
+            store,
+            "forum",
+            ["42"],
+            inbox=inbox,
+            pins=pins,
+            threads=native_threads.get,
+            clock=clock,
+        )
         await bridge.discord.validate("forum")
         await bridge.link("session-one")
         try:
@@ -329,6 +341,7 @@ async def world(tmp_path):
                 base=base,
                 inbox=inbox,
                 pins=pins,
+                native_threads=native_threads,
                 clock=clock,
                 link=store.links()[0],
             )

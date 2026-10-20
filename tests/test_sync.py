@@ -342,6 +342,24 @@ async def test_hidden_context_tool_args_and_reasoning_are_not_published(world):
     assert external.answers == {}
 
 
+async def test_session_references_link_to_their_discord_threads(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    bridge.store.link("20261016_131553_76b5dd", "777", "synced task", "0")
+    world.native_threads["20261020_004724_b790b548"] = "888"
+    external.rows.append(
+        {
+            "row_id": 1,
+            "role": "assistant",
+            "text": "see @session:default/20261016_131553_76b5dd and `@session:20261020_004724_b790b548`, "
+            "not @session:default/20261019_102550_9024fb",
+        }
+    )
+    await bridge.reconcile(link)
+    assert "see <#777> and <#888>, not @session:default/20261019_102550_9024fb" in bodies(
+        external, link["thread"]
+    )
+
+
 async def test_desktop_edits_and_rewinds_update_only_bot_owned_projections(world):
     bridge, external, link = world.bridge, world.external, world.link
     external.rows.extend(
