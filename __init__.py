@@ -7,7 +7,8 @@ import time
 log = logging.getLogger("hermes.discord-sync")
 
 # The bridge touches the heartbeat every 2 seconds. When the backend is down,
-# the normal gateway answers forum posts instead of leaving them unanswered.
+# the normal gateway answers forum posts instead of leaving them unanswered,
+# but a sync @mention gets an offline reply, never a native thread.
 FRESH_SECONDS = 20
 INSTALLED = "_hermes_discord_sync_forum"
 SEEN = "👀"
@@ -21,12 +22,18 @@ def _sync_dir():
     return get_hermes_home() / "discord-sync"
 
 
-def _bridge_alive():
+def _heartbeat_age():
+    """Seconds since the bridge last beat, or None when it never has."""
     try:
         changed = (_sync_dir() / "heartbeat").stat().st_mtime
     except OSError:
-        return False
-    return time.time() - changed < FRESH_SECONDS
+        return None
+    return time.time() - changed
+
+
+def _bridge_alive():
+    age = _heartbeat_age()
+    return age is not None and age < FRESH_SECONDS
 
 
 def _push(event):
@@ -89,9 +96,21 @@ async def _seen(message):
         await message.add_reaction(SEEN)
 
 
+async def _refuse_mention(message):
+    """A sync mention never falls back to a native thread: say the sync is down instead."""
+    age = _heartbeat_age()
+    shown = "never" if age is None else f"{age:.0f}s ago"
+    log.warning("Discord sync refused mention %s: bridge heartbeat %s", message.id, shown)
+    with contextlib.suppress(Exception):
+        await message.reply(f"{OFFLINE} (last heartbeat: {shown})", mention_author=False)
+
+
 async def _claim(bot, message, forum_id):
     """Push a message to the bridge when it owns it. False leaves it to the normal bot."""
     if not _bridge_alive():
+        if _is_sync_mention(bot, message):
+            await _refuse_mention(message)
+            return True
         return False
     channel = message.channel
     if str(getattr(channel, "parent_id", "")) == forum_id:
