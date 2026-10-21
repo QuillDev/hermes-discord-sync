@@ -209,6 +209,9 @@ class Discord:
     async def reopen(self, thread):
         await self.request("PATCH", f"/channels/{thread}", body={"archived": False})
 
+    async def delete_post(self, thread):
+        await self.request("DELETE", f"/channels/{thread}", missing_ok=True)
+
     async def close(self, thread):
         await self.request("PATCH", f"/channels/{thread}", body={"archived": True})
 

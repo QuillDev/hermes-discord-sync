@@ -26,6 +26,7 @@ class Store:
                 PRIMARY KEY(session, address)
             );
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS archived (session TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS inbox (
                 thread TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL,
                 row_id INTEGER, PRIMARY KEY(thread, message)
@@ -63,6 +64,20 @@ class Store:
             raise ValueError("Invalid link update")
         fields = ",".join(f"{name}=?" for name in values)
         self.db.execute(f"UPDATE links SET {fields} WHERE session=?", (*values.values(), session))
+        self.db.commit()
+
+    def retire(self, session):
+        """Forget an archived session's post, remembering to give it a new one if it is unarchived."""
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO archived VALUES(?)", (session,))
+            self.db.execute("DELETE FROM links WHERE session=?", (session,))
+            self.db.execute("DELETE FROM projection WHERE session=?", (session,))
+
+    def retired(self):
+        return [row["session"] for row in self.db.execute("SELECT session FROM archived")]
+
+    def restore(self, session):
+        self.db.execute("DELETE FROM archived WHERE session=?", (session,))
         self.db.commit()
 
     def get_projection(self, session):

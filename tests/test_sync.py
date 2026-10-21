@@ -793,25 +793,15 @@ async def poll(world):
     await world.bridge.tick()
 
 
-async def test_closing_a_post_archives_its_session_until_the_post_reopens(world):
-    bridge, external, link = world.bridge, world.external, world.link
-    thread = link["thread"]
+async def test_closing_a_post_archives_its_session_and_deletes_the_post(world):
+    bridge, external, thread = world.bridge, world.external, world.link["thread"]
     await bridge.tick()
     external.close_post(thread, ago=AUDIT_LAG)
     world.inbox.put({"kind": "tags", "thread": thread, "tags": []})
     await bridge.tick()
     assert external.archived == {"session-one": True}
-    # The poll leaves a closed post closed, and changes that would retag it wait.
-    world.pins.set("session-one", True)
-    for _ in range(3):
-        await poll(world)
-    assert external.threads[thread]["archived"]
-    assert external.tag_names(thread) == []
-    external.reopen_post(thread)
-    world.inbox.put({"kind": "tags", "thread": thread, "tags": []})
     await bridge.tick()
-    assert external.archived == {"session-one": False}
-    assert external.tag_names(thread) == ["pinned"]
+    assert thread not in external.threads
 
 
 async def test_a_close_the_push_missed_is_caught_by_the_poll(world):
@@ -843,52 +833,36 @@ async def test_a_fresh_archive_waits_for_its_audit_entry_before_the_poll_reopens
     assert external.archived == {}
 
 
-async def test_desktop_activity_in_an_archived_session_lands_in_its_post_and_leaves_it_closed(world):
+async def test_archiving_a_session_anywhere_deletes_its_post_and_unarchiving_reposts_its_history(world):
     bridge, external, link = world.bridge, world.external, world.link
-    external.close_post(link["thread"])
-    await poll(world)
-    assert external.archived == {"session-one": True}
     desktop = Rpc(world.http, world.base + "/api/ws")
     await desktop.connect()
     try:
         snapshot = await desktop.call("session.resume", {"session_id": "session-one"})
-        prompt = {"session_id": snapshot["session_id"], "text": "picking this back up"}
-        await desktop.call("prompt.submit", prompt)
+        await desktop.call("prompt.submit", {"session_id": snapshot["session_id"], "text": "keep this"})
     finally:
         await desktop.close()
     await bridge.reconcile(link)
-    await poll(world)
-    assert "you: picking this back up" in bodies(external, link["thread"])
-    assert external.threads[link["thread"]]["archived"]
-    assert external.archived == {"session-one": True}
-
-
-async def test_archiving_a_session_anywhere_closes_its_post_until_it_is_unarchived(world):
-    bridge, external, thread = world.bridge, world.external, world.link["thread"]
-    await bridge.tick()
     # Desktop, an agent or the idle sweep: each one only sets the session's archived flag.
     external.archived["session-one"] = True
     await bridge.tick()
-    assert external.threads[thread]["archived"]
-    # The bot's own close is not taken for an idle archive, so the poll leaves it closed.
-    world.clock.advance(AUDIT_LAG)
+    assert link["thread"] not in external.threads
     for _ in range(3):
         await poll(world)
-    assert external.threads[thread]["archived"]
     assert external.archived == {"session-one": True}
     external.archived["session-one"] = False
     await bridge.tick()
-    assert not external.threads[thread]["archived"]
-    assert external.archived == {"session-one": False}
+    [reposted] = bridge.store.links()
+    assert reposted["thread"] != link["thread"]
+    assert "you: keep this" in bodies(external, reposted["thread"])
 
 
-async def test_a_message_in_the_post_of_an_archived_session_brings_the_session_back(world):
-    bridge, external, link = world.bridge, world.external, world.link
+async def test_a_post_discord_refuses_to_delete_is_retried(world):
+    bridge, external, thread = world.bridge, world.external, world.link["thread"]
     external.archived["session-one"] = True
+    external.refuse_deletes = True
     await bridge.tick()
-    # Discord reopens a closed post when someone posts in it.
-    external.add_message(link["thread"], "one more thing")
-    external.threads[link["thread"]]["archived"] = False
-    await poll(world)
-    assert external.archived == {"session-one": False}
-    assert "one more thing" in external.turns
+    assert thread in external.threads
+    external.refuse_deletes = False
+    await bridge.tick()
+    assert thread not in external.threads
