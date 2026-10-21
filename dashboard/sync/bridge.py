@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -55,6 +56,8 @@ SCAN_AFTER_CHANGE = 5
 HEARTBEAT_EVERY = 2
 STALL_WARN_AFTER = 5
 TICK_EVERY = 0.25
+# A fresh archive waits this long for its audit log entry before the poll treats it as idle.
+AUDIT_LAG = 30
 
 
 class Cadence:
@@ -116,6 +119,17 @@ def _rows(buttons):
 def _preview(text):
     flat = " ".join(str(text or "").split())
     return flat if len(flat) <= PREVIEW_LIMIT else flat[: PREVIEW_LIMIT - 1] + "…"
+
+
+def _is_stale_archive(channel):
+    """Archived long enough ago that a close by a person would already be in the audit log."""
+    metadata = channel.get("thread_metadata") or {}
+    if not metadata.get("archived"):
+        return False
+    stamp = metadata.get("archive_timestamp")
+    if not stamp:
+        return True
+    return time.time() - datetime.fromisoformat(stamp).timestamp() >= AUDIT_LAG
 
 
 def _describe(error):
@@ -383,6 +397,7 @@ class Bridge:
         projection = self.store.get_projection(link["session"]).get(address)
         if projection and projection["body"] == shown:
             return
+        await self._ensure_open(link)
         if projection and not projection["owned"]:
             # A bot cannot edit a human's message. Corrections are a separate
             # visible projection, never a rewrite of the original phone input.
@@ -420,6 +435,8 @@ class Bridge:
     async def remove(self, link, address):
         projection = self.store.get_projection(link["session"]).get(address)
         owned_ids = projection["ids"] if projection and projection["owned"] else []
+        if owned_ids:
+            await self._ensure_open(link)
         for mid in owned_ids:
             await self.discord.delete(link["thread"], mid)
         self.store.forget(link["session"], address)
@@ -470,6 +487,7 @@ class Bridge:
             already_sent = key in self.store.get_projection(link["session"])
             if already_sent or not _is_deliverable(path):
                 continue
+            await self._ensure_open(link)
             data = await asyncio.to_thread(path.read_bytes)
             sent = await self.discord.upload(link["thread"], path.name, data, key=f"{link['session']}:{key}")
             self.store.project(link["session"], key, [sent["id"]], raw)
@@ -639,7 +657,7 @@ class Bridge:
         handlers = {
             "forum": self._forum_message,
             "mention": self.mention,
-            "tags": self._pin_from_tags,
+            "tags": self._thread_updated,
             "press": self.press,
         }
         for handle, event in self.inbox.pending():
@@ -990,6 +1008,7 @@ class Bridge:
         title = payload.get("title")
         if not title or title == link["title"]:
             return
+        await self._ensure_open(link)
         await self.discord.rename(link["thread"], title)
         self.store.update(link["session"], title=title)
 
@@ -1007,6 +1026,7 @@ class Bridge:
     async def _ping(self, link, address, text):
         """A new message that notifies the allowed users; edits never notify, so it is always fresh."""
         await self.remove(link, address)
+        await self._ensure_open(link)
         users = sorted(self.allowed_users)
         body = " ".join(f"<@{user}>" for user in users) + f" {text}"
         key = f"{link['session']}:{address}:{time.time_ns()}"
@@ -1041,6 +1061,9 @@ class Bridge:
         pin_tag = None if pinned is None else await self._pin_tag()
         for link in self.store.links():
             session = link["session"]
+            if self.store.closed(session):
+                # Retagging waits for the post to reopen, rather than fetching it every tick.
+                continue
             was_pinned = self.store.pin(session)
             pin = was_pinned if pinned is None else session in pinned
             status = self._status(link)
@@ -1052,10 +1075,54 @@ class Bridge:
             if status_changed:
                 managed |= {await self._tag(name) for name in STATUS_TAGS}
                 wanted.append(await self._tag(status))
-            await self.discord.retag(link["thread"], managed, wanted)
+            if not await self.discord.retag(link["thread"], managed, wanted):
+                continue
             self.store.set_pin(session, pin)
             if status_changed:
                 self.shown_status[session] = status
+
+    async def _thread_updated(self, event):
+        await self._pin_from_tags(event)
+        link = self._by_thread(event["thread"])
+        if link is not None:
+            await self._follow_post(link, await self.discord.channel(link["thread"]))
+
+    # Closing a post archives its session; reopening it, or new activity, brings it back.
+
+    async def _follow_post(self, link, channel):
+        """Mirror the post's open state onto the session. True while the user has it closed."""
+        session = link["session"]
+        archived = bool((channel.get("thread_metadata") or {}).get("archived"))
+        closed = self.store.closed(session)
+        if archived == closed:
+            return closed
+        if not archived:
+            await self._set_archived(session, False)
+            return self.store.closed(session)
+        # Discord archives idle posts on its own; only a close by an allowed user hides the session.
+        if await self.discord.closed_by(link["thread"]) not in self.allowed_users:
+            return False
+        await self._set_archived(session, True)
+        return self.store.closed(session)
+
+    async def _set_archived(self, session, archived):
+        runtime = self.runtime.get(session, session)
+        try:
+            await self.rpc.call("session.archive", {"session_id": runtime, "archived": archived})
+        except RpcError as error:
+            # Left as it was; the next update or poll of this post tries again.
+            verb = "archive" if archived else "unarchive"
+            log.warning("Discord sync could not %s session %s: %s", verb, session, error)
+            return
+        self.store.set_closed(session, archived)
+        log.info("Discord sync %s session %s", "archived" if archived else "unarchived", session)
+
+    async def _ensure_open(self, link):
+        """Reopen a closed post before writing to it; Discord refuses edits to archived threads."""
+        if not self.store.closed(link["session"]):
+            return
+        await self.discord.reopen(link["thread"])
+        await self._set_archived(link["session"], False)
 
     async def _pin_from_tags(self, event):
         """Discord to desktop: adding or removing the tag pins or unpins the session."""
@@ -1102,7 +1169,11 @@ class Bridge:
             return
         link = links[self.poll_index % len(links)]
         self.poll_index += 1
-        await self.discord.unarchive(link["thread"])
+        channel = await self.discord.channel(link["thread"])
+        closed = await self._follow_post(link, channel)
+        if not closed and _is_stale_archive(channel):
+            # Archived for inactivity: keep the post open so the session can still be read and continued.
+            await self.discord.reopen(link["thread"])
         for message in await self.discord.messages_after(link["thread"], link["cursor"]):
             await self.receive(link, message)
             self._advance_cursor(link, message)

@@ -3,6 +3,7 @@
 import json
 import time
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from urllib.parse import unquote
 
@@ -40,6 +41,10 @@ class ExternalServices:
         self.locked = {}
         # Requests the host already settled, e.g. answered from Desktop.
         self.settled = set()
+        # Desktop's archived flag per stored session, as session.archive set it.
+        self.archived = {}
+        # Discord's audit log of thread updates, oldest first.
+        self.audit = []
 
     def add_post(self, name, content, user="42", parent="forum"):
         # Discord forum posts: the starter message id equals the thread id.
@@ -49,6 +54,23 @@ class ExternalServices:
             {"id": tid, "channel_id": tid, "content": content, "author": {"id": user, "bot": False}}
         )
         return tid
+
+    def close_post(self, thread, user="42", *, ago=0, logged=True):
+        """Archive a post: a person closing it (logged), or Discord's own idle archive (not logged)."""
+        self._set_archived(thread, True, user if logged else None, at=time.time() - ago)
+
+    def reopen_post(self, thread, user="42"):
+        self._set_archived(thread, False, user)
+
+    def _set_archived(self, thread, archived, user, at=None):
+        post = self.threads[thread]
+        if post["archived"] == archived:
+            return
+        post["archived"] = archived
+        post["archive_timestamp"] = at if at is not None else time.time()
+        if user is not None:
+            change = {"key": "archived", "old_value": not archived, "new_value": archived}
+            self.audit.append({"id": self.mid(), "user_id": user, "target_id": thread, "changes": [change]})
 
     def mid(self):
         self.counter += 1
@@ -147,6 +169,11 @@ class ExternalServices:
                     await socket.close()
                     continue
                 await self.event("message.start")
+            elif method == "session.archive":
+                live = params["session_id"]
+                stored = "session-one" if live == "live-one" else live.removeprefix("live-")
+                self.archived[stored] = params["archived"]
+                result = {"archived": params["archived"], "session_key": stored}
             elif method == "session.interrupt":
                 result = {"interrupted": True}
                 await self.event("message.complete", {"status": "interrupted", "text": ""})
@@ -190,6 +217,9 @@ class ExternalServices:
             return web.json_response(
                 {"id": "forum", "type": 15, "guild_id": "guild", "available_tags": self.forum_tags}
             )
+        if path[0] == "guilds" and path[2] == "audit-logs":
+            assert request.query["action_type"] == "111"
+            return web.json_response({"audit_log_entries": list(reversed(self.audit))})
         if path[0] == "guilds":
             return web.json_response(
                 {
@@ -221,13 +251,23 @@ class ExternalServices:
         )
         if len(path) == 2:
             if method == "PATCH":
-                thread.update(await request.json())
+                body = await request.json()
+                if thread["archived"] and body.get("archived") is not False:
+                    # Discord: an archived thread only accepts being unarchived.
+                    return web.json_response({"code": 50083}, status=400)
+                if "archived" in body:
+                    self._set_archived(channel, body.pop("archived"), "bot")
+                thread.update(body)
+            stamp = thread.get("archive_timestamp", 0)
             return web.json_response(
                 {
                     "id": channel,
                     "name": thread["name"],
                     "applied_tags": thread.get("applied_tags", []),
-                    "thread_metadata": {"archived": thread["archived"]},
+                    "thread_metadata": {
+                        "archived": thread["archived"],
+                        "archive_timestamp": datetime.fromtimestamp(stamp, UTC).isoformat(),
+                    },
                 }
             )
         if len(path) == 3 and method == "GET":
@@ -242,6 +282,8 @@ class ExternalServices:
             nonce = body["nonce"]
             if nonce in self.nonces:
                 return web.json_response(self.nonces[nonce])
+            # Discord reopens an archived thread when a message is sent in it.
+            self._set_archived(channel, False, None)
             sent = self.add_message(channel, body["content"], "bot", components=body.get("components", []))
             sent["notifies"] = mentions.get("users", [])
             sent["reply_to"] = (body.get("message_reference") or {}).get("message_id")
@@ -252,6 +294,8 @@ class ExternalServices:
             return web.Response(status=404)
         if method == "GET":
             return web.json_response(message)
+        if thread["archived"]:
+            return web.json_response({"code": 50083}, status=400)
         if method == "PATCH":
             body = await request.json()
             message["content"] = body["content"]

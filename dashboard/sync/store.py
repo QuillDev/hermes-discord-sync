@@ -92,6 +92,14 @@ class Store:
     def set_pin(self, session, pinned):
         self.project(session, "pin", [], "1" if pinned else "0")
 
+    def closed(self, session):
+        """True while the session is archived because its post was closed in Discord."""
+        mirrored = self.get_projection(session).get("closed")
+        return mirrored is not None and mirrored["body"] == "1"
+
+    def set_closed(self, session, closed):
+        self.project(session, "closed", [], "1" if closed else "0")
+
     def inbox_status(self, thread, message):
         row = self.db.execute(
             "SELECT * FROM inbox WHERE thread=? AND message=?", (str(thread), str(message))
