@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import wording as words
-from .discord import chunks, created_at
+from .discord import DiscordError, chunks, created_at
 from .rpc import RpcError
 
 log = logging.getLogger("hermes.discord-sync")
@@ -36,6 +36,7 @@ NEEDS_YOU = "needs you"
 DONE = "done"
 STATUS_TAGS = (WORKING, NEEDS_YOU, DONE)
 TURN_PING = "ping:turn"
+DELETES_PER_PASS = 5
 REQUEST_PINGS = {"approval": "needs your ok", "clarify": "has a question"}
 DESKTOP_ONLY = "needs the desktop app. secrets and desktop-only actions are not sent through discord."
 USAGE = "commands: !stop, !unlink, !approve <request> <choice>, !answer <request> <question> <answer>"
@@ -428,7 +429,8 @@ class Bridge:
             edited = await self.discord.edit(thread, previous_ids[index], part, components=components)
         if edited is not None:
             return edited
-        key = f"{link['session']}:{address}:{index}"
+        # Per post: a session reposted after an unarchive sends its rows again.
+        key = f"{thread}:{link['session']}:{address}:{index}"
         if not address.startswith("row:"):
             # Discord returns the earlier message for a reused nonce, even a deleted one.
             # Transcript rows keep a fixed key so a replay never posts twice; transient
@@ -1092,25 +1094,44 @@ class Bridge:
         if link is not None:
             await self._follow_post(link, await self.discord.channel(link["thread"]))
 
-    # A session's archived flag and its post's open state mirror each other, whichever side changed.
-    # The session is the truth: while it is archived its post stays closed, even through writes.
+    # An archived session's post is deleted, wherever the archive came from; unarchiving it
+    # gives the session a new post with its history. Closing a post in Discord archives its session.
 
     async def push_archived(self):
-        """Desktop to Discord: archiving a session from anywhere closes its post; unarchiving reopens it."""
+        """Desktop to Discord: archived sessions lose their posts; unarchived ones get new posts."""
         archived = None if self.pins is None else self.pins.archived()
         if archived is None:
             return
-        for link in self.store.links():
-            session = link["session"]
-            want = session in archived
-            if want == self.store.closed(session):
-                continue
-            if want:
-                await self.discord.close(link["thread"])
-            else:
-                await self.discord.reopen(link["thread"])
-            self.store.set_closed(session, want)
-            log.info("Discord sync %s the post of session %s", "closed" if want else "reopened", session)
+        doomed = [link for link in self.store.links() if link["session"] in archived]
+        # A few per pass: a bulk archive must not hold the loop while Discord rate-limits deletes.
+        for link in doomed[:DELETES_PER_PASS]:
+            await self._delete_post(link)
+        back = next((session for session in self.store.retired() if session not in archived), None)
+        if back is not None:
+            await self._repost(back)
+
+    async def _delete_post(self, link):
+        session = link["session"]
+        try:
+            await self.discord.delete_post(link["thread"])
+        except DiscordError as error:
+            # Left closed instead; the next pass tries again.
+            log.warning("Discord sync could not delete the post of session %s: %s", session, error)
+            return
+        self.store.retire(session)
+        runtime = self.runtime.get(session)
+        for live in (self.working, self.streams, self.activity):
+            live.pop(runtime, None)
+        log.info("Discord sync deleted the post of archived session %s", session)
+
+    async def _repost(self, session):
+        """One per pass, since it copies the whole history into the new post."""
+        try:
+            await self._link(session)
+        except (RpcError, ValueError) as error:
+            log.warning("Discord sync could not repost unarchived session %s: %s", session, error)
+        self.store.restore(session)
+        log.info("Discord sync reposted unarchived session %s", session)
 
     async def _follow_post(self, link, channel):
         """Mirror the post's open state onto the session. True while the user has it closed."""

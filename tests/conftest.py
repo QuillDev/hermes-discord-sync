@@ -43,6 +43,8 @@ class ExternalServices:
         self.settled = set()
         # Desktop's archived flag per stored session, as session.archive set it.
         self.archived = {}
+        # Discord answering 403 to deleting a post, as when the bot lacks Manage Threads.
+        self.refuse_deletes = False
         # Discord's audit log of thread updates, oldest first.
         self.audit = []
 
@@ -246,6 +248,12 @@ class ExternalServices:
             if method == "DELETE" and emoji in mine:
                 mine.remove(emoji)
             return web.Response(status=204)
+        if len(path) == 2 and method == "DELETE":
+            if self.refuse_deletes:
+                return web.json_response({"code": 50013}, status=403)
+            if self.threads.pop(channel, None) is None:
+                return web.Response(status=404)
+            return web.json_response({"id": channel})
         thread = self.threads.setdefault(
             channel, {"name": channel, "messages": [], "archived": False, "parent_id": "text"}
         )
