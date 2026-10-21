@@ -37,6 +37,8 @@ class ExternalServices:
         # The bot's reactions: (channel, message id) -> emoji, in the order they were added.
         self.reactions = {}
         self.busy_status = None
+        # Turn isolation: the receipt carries no user row id, and the stored row gains host context.
+        self.isolated = False
         self.questions = {}
         self.locked = {}
         # Requests the host already settled, e.g. answered from Desktop.
@@ -164,9 +166,12 @@ class ExternalServices:
                     await socket.send_json({"jsonrpc": "2.0", "id": frame["id"], "result": result})
                     continue
                 row_id = len(self.rows) + 1
-                self.rows.append({"row_id": row_id, "role": "user", "text": params["text"]})
+                stored = params["text"] + ("\n\nVoice: lowercase." if self.isolated else "")
+                self.rows.append({"row_id": row_id, "role": "user", "text": stored})
                 self.turns.append(params["text"])
-                result = {"status": "streaming", "user_row_id": row_id}
+                result = {"status": "streaming"}
+                if not self.isolated:
+                    result["user_row_id"] = row_id
                 if self.drop_after_submit:
                     await socket.close()
                     continue

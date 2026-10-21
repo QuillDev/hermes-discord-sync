@@ -60,6 +60,8 @@ STALL_WARN_AFTER = 5
 TICK_EVERY = 0.25
 # A fresh archive waits this long for its audit log entry before the poll treats it as idle.
 AUDIT_LAG = 30
+# A Discord prompt whose row never shows up (merged into a steer, dropped) stops waiting to be claimed.
+UNCLAIMED_FOR = 600
 
 
 class Cadence:
@@ -191,6 +193,7 @@ class Bridge:
         self.lock = asyncio.Lock()
         self.connected = False
         self.last_error = None
+        self.clock = clock
         self.scan_cadence = Cadence(SCAN_EVERY, clock)
         self.stream_cadence = Cadence(STREAM_EDIT_EVERY, clock)
         self.typing_cadence = Cadence(TYPING_EVERY, clock)
@@ -211,6 +214,9 @@ class Bridge:
         self.activity = {}
         # Turns a Discord message steered into; their finish pings like a Discord-started turn.
         self.steered = set()
+        # Stored session id -> Discord messages submitted without a user row id (an isolated
+        # turn's receipt has none yet), oldest first. Reconcile claims their rows instead of echoing them.
+        self.unclaimed = {}
         # Stored session id -> how its last turn ended (DONE or NEEDS_YOU), and the status tag on its post.
         self.finished = {}
         self.shown_status = {}
@@ -463,7 +469,8 @@ class Bridge:
             published.add(address)
             text = message["text"]
             if message["role"] == "user":
-                await self.upsert(link, address, f"you: {text}")
+                if not self._claim(link, address, text):
+                    await self.upsert(link, address, f"you: {text}")
                 continue
             await self.upsert(link, address, text)
             await self.artifacts(link, address, text)
@@ -471,6 +478,24 @@ class Bridge:
             if address.startswith("row:") and address not in published:
                 await self.remove(link, address)
         self.notify(link["session"])
+
+    def _claim(self, link, address, text):
+        """Map a new user row to the Discord message that sent it, so the bot never reposts it.
+
+        The host stores the prompt with additions (attachment notes, appended context), so the
+        row starts with what the human typed rather than equalling it.
+        """
+        if address in self.store.get_projection(link["session"]):
+            return False
+        pending = self.unclaimed.get(link["session"], [])
+        pending[:] = [claim for claim in pending if self.clock() - claim["at"] < UNCLAIMED_FOR]
+        for claim in pending:
+            if text.strip().startswith(claim["text"]):
+                pending.remove(claim)
+                body = f"you: {text}"
+                self.store.project(link["session"], address, [claim["mid"]], body, owned=False)
+                return True
+        return False
 
     def _adopt_stream(self, link, messages):
         """The streamed reply becomes the finished row in place: edited, not deleted and reposted."""
@@ -554,6 +579,9 @@ class Bridge:
             # The human's own message already shows this row; the bot never reposts it.
             body = f"you: {submitted['prompt']}"
             self.store.project(link["session"], f"row:{row_id}", [str(message["id"])], body, owned=False)
+        else:
+            claim = {"mid": str(message["id"]), "text": text.strip(), "at": self.clock()}
+            self.unclaimed.setdefault(link["session"], []).append(claim)
         self.notify(link["session"])
         return "accepted", row_id, submitted["status"]
 
