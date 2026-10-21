@@ -58,6 +58,25 @@ async def test_both_clients_share_the_same_history_and_run_only_one_turn(world):
         await desktop.close()
 
 
+async def test_isolated_turn_from_discord_is_not_echoed_but_desktop_input_is(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    external.isolated = True
+    phone = external.add_message(link["thread"], "phone question")
+    await bridge.receive(link, phone)
+    await bridge.reconcile(link)
+    await bridge.reconcile(link)
+    assert not any(body.startswith("you: phone question") for body in bodies(external, link["thread"]))
+
+    desktop = Rpc(world.http, world.base + "/api/ws")
+    await desktop.connect()
+    try:
+        await desktop.call("prompt.submit", {"session_id": "live-one", "text": "desktop question"})
+    finally:
+        await desktop.close()
+    await bridge.reconcile(link)
+    assert any(body.startswith("you: desktop question") for body in bodies(external, link["thread"]))
+
+
 async def test_live_stream_is_edited_then_reconciled_without_duplicate_final_reply(world):
     bridge, external, link = world.bridge, world.external, world.link
     await external.event("message.start")
