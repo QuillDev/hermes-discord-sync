@@ -82,10 +82,15 @@ def _is_command(text):
     return text in {"!stop", "/stop", "!unlink"} or text.startswith(("!approve ", "!answer "))
 
 
+# Kinds of row a person wrote or should read. Every other kind is host traffic:
+# background-process and subagent notices, model switches, auto-continues.
+PUBLISHED_KINDS = {None, "steer", "failed_turn"}
+
+
 def _is_published(message):
-    """Only real user and assistant turns reach Discord: no hidden context, tools or system rows."""
+    """Only real user and assistant turns reach Discord: no notices, hidden context, tools or system rows."""
     has_row = message.get("row_id") is not None
-    hidden = message.get("display_kind") == "hidden"
+    hidden = message.get("display_kind") not in PUBLISHED_KINDS
     conversational = message.get("role") in {"user", "assistant"}
     has_text = bool((message.get("text") or "").strip())
     return has_row and not hidden and conversational and has_text

@@ -329,11 +329,15 @@ async def test_hidden_context_tool_args_and_reasoning_are_not_published(world):
             {"row_id": 2, "role": "user", "text": "hidden secret", "display_kind": "hidden"},
             {"row_id": 3, "role": "tool", "text": "tool secret"},
             {"row_id": 4, "role": "assistant", "text": "public answer", "reasoning": "private reasoning"},
+            {"row_id": 5, "role": "user", "text": "process secret", "display_kind": "process_complete"},
+            {"row_id": 6, "role": "user", "text": "subagent secret", "display_kind": "async_delegation_complete"},
+            {"row_id": 7, "role": "user", "text": "steered mid-turn", "display_kind": "steer"},
         ]
     )
     await bridge.reconcile(link)
     output = thread_text(external, link["thread"])
     assert "public answer" in output
+    assert "steered mid-turn" in output
     assert "secret" not in output
     assert "reasoning" not in output
     secret = {"session_id": "live-one", "env_var": "PASSWORD", "prompt": "enter password"}
