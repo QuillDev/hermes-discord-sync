@@ -843,7 +843,7 @@ async def test_a_fresh_archive_waits_for_its_audit_entry_before_the_poll_reopens
     assert external.archived == {}
 
 
-async def test_new_desktop_activity_in_a_closed_post_reopens_it_and_unarchives_the_session(world):
+async def test_desktop_activity_in_an_archived_session_lands_in_its_post_and_leaves_it_closed(world):
     bridge, external, link = world.bridge, world.external, world.link
     external.close_post(link["thread"])
     await poll(world)
@@ -857,6 +857,38 @@ async def test_new_desktop_activity_in_a_closed_post_reopens_it_and_unarchives_t
     finally:
         await desktop.close()
     await bridge.reconcile(link)
+    await poll(world)
     assert "you: picking this back up" in bodies(external, link["thread"])
-    assert not external.threads[link["thread"]]["archived"]
+    assert external.threads[link["thread"]]["archived"]
+    assert external.archived == {"session-one": True}
+
+
+async def test_archiving_a_session_anywhere_closes_its_post_until_it_is_unarchived(world):
+    bridge, external, thread = world.bridge, world.external, world.link["thread"]
+    await bridge.tick()
+    # Desktop, an agent or the idle sweep: each one only sets the session's archived flag.
+    external.archived["session-one"] = True
+    await bridge.tick()
+    assert external.threads[thread]["archived"]
+    # The bot's own close is not taken for an idle archive, so the poll leaves it closed.
+    world.clock.advance(AUDIT_LAG)
+    for _ in range(3):
+        await poll(world)
+    assert external.threads[thread]["archived"]
+    assert external.archived == {"session-one": True}
+    external.archived["session-one"] = False
+    await bridge.tick()
+    assert not external.threads[thread]["archived"]
     assert external.archived == {"session-one": False}
+
+
+async def test_a_message_in_the_post_of_an_archived_session_brings_the_session_back(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    external.archived["session-one"] = True
+    await bridge.tick()
+    # Discord reopens a closed post when someone posts in it.
+    external.add_message(link["thread"], "one more thing")
+    external.threads[link["thread"]]["archived"] = False
+    await poll(world)
+    assert external.archived == {"session-one": False}
+    assert "one more thing" in external.turns

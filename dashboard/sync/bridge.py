@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import logging
@@ -397,13 +398,16 @@ class Bridge:
         projection = self.store.get_projection(link["session"]).get(address)
         if projection and projection["body"] == shown:
             return
-        await self._ensure_open(link)
         if projection and not projection["owned"]:
             # A bot cannot edit a human's message. Corrections are a separate
             # visible projection, never a rewrite of the original phone input.
             projection = None
         previous_ids = projection["ids"] if projection else []
-        parts = chunks(body)
+        async with self._writable(link):
+            sent_ids = await self._write_parts(link, address, chunks(body), previous_ids, components)
+        self.store.project(link["session"], address, sent_ids, shown)
+
+    async def _write_parts(self, link, address, parts, previous_ids, components):
         sent_ids = []
         for index, part in enumerate(parts):
             # Long backfills keep the gateway reservation alive.
@@ -414,7 +418,7 @@ class Bridge:
             sent_ids.append(sent["id"])
         for stale in previous_ids[len(parts) :]:
             await self.discord.delete(link["thread"], stale)
-        self.store.project(link["session"], address, sent_ids, shown)
+        return sent_ids
 
     async def _write_part(self, link, address, index, part, previous_ids, components):
         """Edit the message already holding this part, or send a new one when there is none."""
@@ -436,9 +440,9 @@ class Bridge:
         projection = self.store.get_projection(link["session"]).get(address)
         owned_ids = projection["ids"] if projection and projection["owned"] else []
         if owned_ids:
-            await self._ensure_open(link)
-        for mid in owned_ids:
-            await self.discord.delete(link["thread"], mid)
+            async with self._writable(link):
+                for mid in owned_ids:
+                    await self.discord.delete(link["thread"], mid)
         self.store.forget(link["session"], address)
 
     async def reconcile(self, link, *, adopt_stream=False):
@@ -487,9 +491,10 @@ class Bridge:
             already_sent = key in self.store.get_projection(link["session"])
             if already_sent or not _is_deliverable(path):
                 continue
-            await self._ensure_open(link)
             data = await asyncio.to_thread(path.read_bytes)
-            sent = await self.discord.upload(link["thread"], path.name, data, key=f"{link['session']}:{key}")
+            upload_key = f"{link['session']}:{key}"
+            async with self._writable(link):
+                sent = await self.discord.upload(link["thread"], path.name, data, key=upload_key)
             self.store.project(link["session"], key, [sent["id"]], raw)
 
     # Reading from Discord
@@ -1008,8 +1013,8 @@ class Bridge:
         title = payload.get("title")
         if not title or title == link["title"]:
             return
-        await self._ensure_open(link)
-        await self.discord.rename(link["thread"], title)
+        async with self._writable(link):
+            await self.discord.rename(link["thread"], title)
         self.store.update(link["session"], title=title)
 
     async def _on_request_cancel(self, link, runtime, payload):
@@ -1026,11 +1031,11 @@ class Bridge:
     async def _ping(self, link, address, text):
         """A new message that notifies the allowed users; edits never notify, so it is always fresh."""
         await self.remove(link, address)
-        await self._ensure_open(link)
         users = sorted(self.allowed_users)
         body = " ".join(f"<@{user}>" for user in users) + f" {text}"
         key = f"{link['session']}:{address}:{time.time_ns()}"
-        sent = await self.discord.send(link["thread"], body, key=key, ping=users)
+        async with self._writable(link):
+            sent = await self.discord.send(link["thread"], body, key=key, ping=users)
         self.store.project(link["session"], address, [sent["id"]], body)
 
     # Forum tags: pins (Discord allows one pinned post per forum, so a tag stands in) and status.
@@ -1087,7 +1092,25 @@ class Bridge:
         if link is not None:
             await self._follow_post(link, await self.discord.channel(link["thread"]))
 
-    # Closing a post archives its session; reopening it, or new activity, brings it back.
+    # A session's archived flag and its post's open state mirror each other, whichever side changed.
+    # The session is the truth: while it is archived its post stays closed, even through writes.
+
+    async def push_archived(self):
+        """Desktop to Discord: archiving a session from anywhere closes its post; unarchiving reopens it."""
+        archived = None if self.pins is None else self.pins.archived()
+        if archived is None:
+            return
+        for link in self.store.links():
+            session = link["session"]
+            want = session in archived
+            if want == self.store.closed(session):
+                continue
+            if want:
+                await self.discord.close(link["thread"])
+            else:
+                await self.discord.reopen(link["thread"])
+            self.store.set_closed(session, want)
+            log.info("Discord sync %s the post of session %s", "closed" if want else "reopened", session)
 
     async def _follow_post(self, link, channel):
         """Mirror the post's open state onto the session. True while the user has it closed."""
@@ -1117,12 +1140,17 @@ class Bridge:
         self.store.set_closed(session, archived)
         log.info("Discord sync %s session %s", "archived" if archived else "unarchived", session)
 
-    async def _ensure_open(self, link):
-        """Reopen a closed post before writing to it; Discord refuses edits to archived threads."""
-        if not self.store.closed(link["session"]):
-            return
-        await self.discord.reopen(link["thread"])
-        await self._set_archived(link["session"], False)
+    @contextlib.asynccontextmanager
+    async def _writable(self, link):
+        """Discord refuses edits to closed posts: open one for the write, then close it again."""
+        closed = self.store.closed(link["session"])
+        if closed:
+            await self.discord.reopen(link["thread"])
+        try:
+            yield
+        finally:
+            if closed:
+                await self.discord.close(link["thread"])
 
     async def _pin_from_tags(self, event):
         """Discord to desktop: adding or removing the tag pins or unpins the session."""
@@ -1142,6 +1170,7 @@ class Bridge:
         async with self.lock:
             await self.drain()
             await self.push_tags()
+            await self.push_archived()
             await self.scan()
             await self._flush_streams()
             await self._keep_typing()
@@ -1153,14 +1182,16 @@ class Bridge:
         for runtime in list({*self.streams, *self.activity}):
             link = self._by_runtime(runtime)
             body = self._live_body(runtime)
-            if link and body:
+            # A closed post gets the finished reply, not a reopen and close every second.
+            if link and body and not self.store.closed(link["session"]):
                 await self.upsert(link, "stream", body)
 
     async def _keep_typing(self):
         if not self.typing_cadence.due():
             return
         for link in list(self.working.values()):
-            await self.discord.typing(link["thread"])
+            if not self.store.closed(link["session"]):
+                await self.discord.typing(link["thread"])
 
     async def _poll_next_thread(self):
         """Safety net for anything the push path missed: one thread per pass keeps a cycle cheap."""
