@@ -115,7 +115,7 @@ def _notify(session):
 
 
 class HermesPins:
-    """Desktop pins, read from and written to the profile's own session database."""
+    """Desktop pins and archives, read from (pins also written to) the profile's own session database."""
 
     def __init__(self, home):
         self.path = home / "state.db"
@@ -123,6 +123,11 @@ class HermesPins:
     def pinned(self):
         with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)) as db:
             return {row[0] for row in db.execute("SELECT id FROM sessions WHERE pinned=1")}
+
+    def archived(self):
+        # Every archive lands here: Desktop, session.archive, an agent, or the idle sweep.
+        with closing(sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)) as db:
+            return {row[0] for row in db.execute("SELECT id FROM sessions WHERE archived=1")}
 
     def set(self, session, pinned):
         # The same SessionDB setter the sessions PATCH route uses; the backend's

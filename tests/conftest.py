@@ -320,13 +320,17 @@ class FakeClock:
 
 
 class FakePins:
-    """Desktop's pinned sessions, as Hermes stores them."""
+    """Desktop's pinned and archived sessions, as Hermes stores them."""
 
-    def __init__(self):
+    def __init__(self, external):
         self.sessions = set()
+        self.external = external
 
     def pinned(self):
         return set(self.sessions)
+
+    def archived(self):
+        return {session for session, archived in self.external.archived.items() if archived}
 
     def set(self, session, pinned):
         if pinned:
@@ -359,7 +363,7 @@ async def world(tmp_path):
         await rpc.connect()
         store = Store(tmp_path / "sync" / "state.db")
         inbox = Inbox(tmp_path / "sync" / "inbox")
-        pins = FakePins()
+        pins = FakePins(external)
         clock = FakeClock()
         # Sessions the native gateway answers in a Discord thread: session id -> thread id.
         native_threads = {}

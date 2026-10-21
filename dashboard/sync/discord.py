@@ -209,6 +209,9 @@ class Discord:
     async def reopen(self, thread):
         await self.request("PATCH", f"/channels/{thread}", body={"archived": False})
 
+    async def close(self, thread):
+        await self.request("PATCH", f"/channels/{thread}", body={"archived": True})
+
     async def closed_by(self, thread):
         """Who closed the post, from the audit log. None when Discord archived it for inactivity."""
         path = f"/guilds/{self.guild}/audit-logs?action_type={THREAD_UPDATE}&limit=100"
