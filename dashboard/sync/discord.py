@@ -6,12 +6,16 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 from urllib.parse import quote
 
 import aiohttp
 
+log = logging.getLogger("hermes.discord-sync")
+
 API = "https://discord.com/api/v10"
 FORUM_CHANNEL = 15
+THREAD_UPDATE = 111
 DISCORD_EPOCH_MS = 1420070400000
 MESSAGE_LIMIT = 1900
 TITLE_LIMIT = 100
@@ -144,13 +148,18 @@ class Discord:
         return next(tag["id"] for tag in updated["available_tags"] if tag["name"] == name)
 
     async def retag(self, thread, managed, wanted):
-        """Swap the managed tags on a post for the wanted ones; tags someone else added stay."""
+        """Swap the managed tags on a post for the wanted ones; tags someone else added stay.
+
+        False when the post is archived: Discord refuses edits to it until it reopens."""
         channel = await self.request("GET", f"/channels/{thread}")
+        if (channel.get("thread_metadata") or {}).get("archived"):
+            return False
         applied = channel.get("applied_tags", [])
         kept = [tag for tag in applied if tag not in managed and tag not in wanted]
         tags = [*wanted, *kept][:MAX_TAGS]
         if set(tags) != set(applied):
             await self.request("PATCH", f"/channels/{thread}", body={"applied_tags": tags})
+        return True
 
     async def active_threads(self):
         found = await self.request("GET", f"/guilds/{self.guild}/threads/active")
@@ -194,10 +203,28 @@ class Discord:
     async def rename(self, thread, title):
         await self.request("PATCH", f"/channels/{thread}", body={"name": title[:TITLE_LIMIT]})
 
-    async def unarchive(self, thread):
-        channel = await self.request("GET", f"/channels/{thread}")
-        if channel.get("thread_metadata", {}).get("archived"):
-            await self.request("PATCH", f"/channels/{thread}", body={"archived": False})
+    async def channel(self, thread):
+        return await self.request("GET", f"/channels/{thread}")
+
+    async def reopen(self, thread):
+        await self.request("PATCH", f"/channels/{thread}", body={"archived": False})
+
+    async def closed_by(self, thread):
+        """Who closed the post, from the audit log. None when Discord archived it for inactivity."""
+        path = f"/guilds/{self.guild}/audit-logs?action_type={THREAD_UPDATE}&limit=100"
+        try:
+            found = await self.request("GET", path)
+        except DiscordError as error:
+            log.warning("Discord sync cannot read the audit log (HTTP %s); closed posts reopen", error.status)
+            return None
+        # Newest first: the latest change to `archived` is the one that applies now.
+        for entry in found.get("audit_log_entries", []):
+            if str(entry.get("target_id")) != str(thread):
+                continue
+            for change in entry.get("changes") or []:
+                if change.get("key") == "archived":
+                    return str(entry.get("user_id")) if change.get("new_value") else None
+        return None
 
     async def upload(self, thread, filename, content, *, key):
         def form():

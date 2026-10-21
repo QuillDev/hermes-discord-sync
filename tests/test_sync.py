@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dashboard.sync.bridge import POLL_EVERY, SCAN_EVERY, STREAM_EDIT_EVERY
+from dashboard.sync.bridge import AUDIT_LAG, POLL_EVERY, SCAN_EVERY, STREAM_EDIT_EVERY
 from dashboard.sync.discord import chunks
 from dashboard.sync.inbox import Inbox
 from dashboard.sync.rpc import Rpc
@@ -786,3 +786,77 @@ async def test_a_multiplexed_gateway_still_hands_allowed_mentions_to_the_bridge(
     pushed = [event["message"]["content"] for _, event in inbox.pending()]
     assert pushed == ["<@42> from quill"]
     assert answered_by_gateway == ["<@42> from a stranger"]
+
+
+async def poll(world):
+    world.clock.advance(POLL_EVERY)
+    await world.bridge.tick()
+
+
+async def test_closing_a_post_archives_its_session_until_the_post_reopens(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    thread = link["thread"]
+    await bridge.tick()
+    external.close_post(thread, ago=AUDIT_LAG)
+    world.inbox.put({"kind": "tags", "thread": thread, "tags": []})
+    await bridge.tick()
+    assert external.archived == {"session-one": True}
+    # The poll leaves a closed post closed, and changes that would retag it wait.
+    world.pins.set("session-one", True)
+    for _ in range(3):
+        await poll(world)
+    assert external.threads[thread]["archived"]
+    assert external.tag_names(thread) == []
+    external.reopen_post(thread)
+    world.inbox.put({"kind": "tags", "thread": thread, "tags": []})
+    await bridge.tick()
+    assert external.archived == {"session-one": False}
+    assert external.tag_names(thread) == ["pinned"]
+
+
+async def test_a_close_the_push_missed_is_caught_by_the_poll(world):
+    external, link = world.external, world.link
+    external.close_post(link["thread"])
+    # A retag due before the bridge sees the close waits instead of failing the pass.
+    world.pins.set("session-one", True)
+    await poll(world)
+    assert external.archived == {"session-one": True}
+    assert external.threads[link["thread"]]["archived"]
+
+
+async def test_idle_archives_and_closes_by_others_reopen_without_hiding_the_session(world):
+    external, thread = world.external, world.link["thread"]
+    external.close_post(thread, ago=60, logged=False)
+    await poll(world)
+    assert not external.threads[thread]["archived"]
+    external.close_post(thread, user="99", ago=60)
+    await poll(world)
+    assert not external.threads[thread]["archived"]
+    assert external.archived == {}
+
+
+async def test_a_fresh_archive_waits_for_its_audit_entry_before_the_poll_reopens_it(world):
+    external, thread = world.external, world.link["thread"]
+    external.close_post(thread, logged=False)
+    await poll(world)
+    assert external.threads[thread]["archived"]
+    assert external.archived == {}
+
+
+async def test_new_desktop_activity_in_a_closed_post_reopens_it_and_unarchives_the_session(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    external.close_post(link["thread"])
+    await poll(world)
+    assert external.archived == {"session-one": True}
+    desktop = Rpc(world.http, world.base + "/api/ws")
+    await desktop.connect()
+    try:
+        snapshot = await desktop.call("session.resume", {"session_id": "session-one"})
+        prompt = {"session_id": snapshot["session_id"], "text": "picking this back up"}
+        await desktop.call("prompt.submit", prompt)
+    finally:
+        await desktop.close()
+    await bridge.reconcile(link)
+    assert "you: picking this back up" in bodies(external, link["thread"])
+    assert not external.threads[link["thread"]]["archived"]
+    assert external.archived == {"session-one": False}

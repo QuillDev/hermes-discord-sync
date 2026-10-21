@@ -19,7 +19,7 @@ import pytest
 from aiohttp import web
 from conftest import ExternalServices, FakeClock, serving
 
-from dashboard.sync.bridge import Bridge
+from dashboard.sync.bridge import AUDIT_LAG, POLL_EVERY, SCAN_EVERY, Bridge
 from dashboard.sync.discord import Discord
 from dashboard.sync.inbox import Inbox
 from dashboard.sync.rpc import Rpc
@@ -179,7 +179,8 @@ dashboard:
             await rpc.connect()
             store = Store(tmp_path / "sync" / "state.db")
             discord = Discord(http, "fixture-only", service + "/discord")
-            bridge = Bridge(rpc, discord, store, "forum", ["42"], clock=FakeClock())
+            clock = FakeClock()
+            bridge = Bridge(rpc, discord, store, "forum", ["42"], clock=clock)
             await bridge.discord.validate("forum")
             linked = await bridge.link(stored)
             assert "you: desktop input" in [
@@ -202,8 +203,22 @@ dashboard:
             await bridge.attach(linked)
             again = await desktop.call("session.history", {"session_id": desktop_id})
             assert again == history
+
+            # Closing the post archives the session in the real store; reopening brings it back.
+            async def listed_ids():
+                return {row["id"] for row in (await desktop.call("session.list", {"limit": 50}))["sessions"]}
+
+            external.close_post(linked["thread"], ago=AUDIT_LAG)
+            clock.advance(POLL_EVERY)
+            await bridge.tick()
+            assert stored not in await listed_ids()
+            external.reopen_post(linked["thread"])
+            clock.advance(POLL_EVERY)
+            await bridge.tick()
+            assert stored in await listed_ids()
             # A brand-new forum post becomes a real desktop session on the real backend.
             post = external.add_post("started on phone", "phone-started task")
+            clock.advance(SCAN_EVERY)
             await bridge.tick()
             started = next(link for link in store.links() if link["thread"] == post)
             runtime = (await desktop.call("session.resume", {"session_id": started["session"]}))["session_id"]
