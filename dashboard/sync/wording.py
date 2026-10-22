@@ -64,7 +64,17 @@ ACK_KEYS = {
 STATUS_REACTIONS = {"steered": STEERED, "redirected": REDIRECTED, "queued": QUEUED}
 
 
+def _on(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off", ""}
+    return bool(value)
+
+
 class Wording:
+    def display(self, setting, default):
+        """A ``display.*`` setting for Discord; outside Hermes nothing is configured."""
+        return default
+
     def text(self, key, **values):
         return _ENGLISH[key].format(**values)
 
@@ -74,10 +84,17 @@ class Wording:
     def ack(self, status):
         """The native busy acknowledgement for a prompt.submit status, or None for a new turn."""
         keys = ACK_KEYS.get(status)
-        if keys is None:
+        if keys is None or not self.ack_shown(status):
             return None
         head, tail = keys
         return self.text(head) + self.text(tail)
+
+    def ack_shown(self, status):
+        """The gateway's rule: ``busy_ack_enabled`` hides every busy ack, and
+        ``busy_steer_ack_enabled`` hides the steer one. Reactions show either way."""
+        if not _on(self.display("busy_ack_enabled", True)):
+            return False
+        return status != "steered" or _on(self.display("busy_steer_ack_enabled", True))
 
     def approval_label(self, choice):
         known = APPROVAL_BUTTONS.get(choice)
@@ -93,7 +110,14 @@ class Wording:
 
 
 class HermesWording(Wording):
-    """The running Hermes catalog, so wording and language match the native bot."""
+    """The running Hermes catalog and display settings, so the forum matches the native bot."""
+
+    def display(self, setting, default):
+        from gateway.display_config import resolve_display_setting
+        from hermes_cli.config import load_config
+
+        # The gateway's own resolver: display.platforms.discord.<setting>, then display.<setting>.
+        return resolve_display_setting(load_config(), "discord", setting, default)
 
     def text(self, key, **values):
         from agent.i18n import t
