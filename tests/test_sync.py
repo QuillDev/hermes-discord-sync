@@ -13,6 +13,7 @@ from dashboard.sync.discord import chunks
 from dashboard.sync.inbox import Inbox
 from dashboard.sync.rpc import Rpc
 from dashboard.sync.store import Store
+from dashboard.sync.wording import Wording
 
 HERMES_AGENT = Path(os.environ.get("HERMES_AGENT_DIR", Path.home() / ".hermes" / "hermes-agent"))
 PLUGIN_ROOT = Path(__file__).parents[1]
@@ -243,6 +244,37 @@ async def test_message_status_shows_as_reactions_like_the_native_bot(world):
     await external.event("message.complete", {"status": "interrupted", "text": ""})
     await through(bridge, "message.complete")
     assert external.reacted(thread, queued["id"]) == ["⏹️"]
+
+
+class QuietWording(Wording):
+    def __init__(self, **settings):
+        self.settings = settings
+
+    def display(self, setting, default):
+        return self.settings.get(setting, default)
+
+
+async def test_busy_acks_follow_the_display_settings_but_reactions_stay(world):
+    bridge, external, link = world.bridge, world.external, world.link
+    thread = link["thread"]
+    await bridge.receive(link, external.add_message(thread, "build it"))
+    bridge.words = QuietWording(busy_steer_ack_enabled=False)
+    external.busy_status = "steered"
+    steer = external.add_message(thread, "use the fast path")
+    await bridge.receive(link, steer)
+    assert external.reacted(thread, steer["id"]) == ["⏩"]
+    assert not any(m.get("reply_to") == steer["id"] for m in external.threads[thread]["messages"])
+    # Only the steer ack is off: a queued message still says so.
+    external.busy_status = "queued"
+    queued = external.add_message(thread, "then deploy")
+    await bridge.receive(link, queued)
+    assert external.threads[thread]["messages"][-1]["content"].startswith("⏳ Queued")
+    # busy_ack_enabled off hides them all.
+    bridge.words = QuietWording(busy_ack_enabled="false")
+    later = external.add_message(thread, "and test it")
+    await bridge.receive(link, later)
+    assert external.reacted(thread, later["id"]) == ["⏳"]
+    assert not any(m.get("reply_to") == later["id"] for m in external.threads[thread]["messages"])
 
 
 async def test_a_reply_to_a_redirect_lands_below_the_redirecting_message(world):
