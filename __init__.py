@@ -16,30 +16,70 @@ BUTTON_PREFIX = "hds:"
 OFFLINE = "discord sync is offline right now. try again in a moment, or answer in the desktop app."
 
 
-def _sync_dir():
+def _sync_dir(profile="default"):
     from hermes_constants import get_hermes_home
 
-    return get_hermes_home() / "discord-sync"
+    if profile == "default":
+        return get_hermes_home() / "discord-sync"
+    from hermes_cli.profiles import get_profile_dir
+
+    return get_profile_dir(profile) / "discord-sync"
 
 
-def _heartbeat_age():
-    """Seconds since the bridge last beat, or None when it never has."""
+def _forums(ctx):
+    """Forum id -> the profile it syncs: forum_id for default, plus one per entry under profiles."""
+    found = {}
+    default = str(ctx.get_config("forum_id", ""))
+    if default.isdecimal():
+        found[default] = "default"
+    for name, profile in (ctx.get_config("profiles", None) or {}).items():
+        forum = str((profile or {}).get("forum_id", ""))
+        if forum.isdecimal() and forum not in found:
+            found[forum] = str(name)
+    return found
+
+
+def _routed_profile(message):
+    """The profile the gateway's profile_routes send this message to, or "default"."""
     try:
-        changed = (_sync_dir() / "heartbeat").stat().st_mtime
+        from gateway.profile_routing import match_profile_route, parse_profile_routes
+        from hermes_cli.config import load_config
+
+        routes = parse_profile_routes((load_config().get("gateway") or {}).get("profile_routes"))
+    except Exception:
+        log.debug("Discord sync could not read profile routes", exc_info=True)
+        return "default"
+    channel = message.channel
+    parent = getattr(channel, "parent_id", None)
+    route = match_profile_route(
+        routes,
+        "discord",
+        guild_id=str(getattr(message.guild, "id", "")) or None,
+        chat_id=str(channel.id),
+        parent_chat_id=str(parent) if parent else None,
+        user_id=str(message.author.id),
+    )
+    return route.profile if route else "default"
+
+
+def _heartbeat_age(profile="default"):
+    """Seconds since the profile's bridge last beat, or None when it never has."""
+    try:
+        changed = (_sync_dir(profile) / "heartbeat").stat().st_mtime
     except OSError:
         return None
     return time.time() - changed
 
 
-def _bridge_alive():
-    age = _heartbeat_age()
+def _bridge_alive(profile="default"):
+    age = _heartbeat_age(profile)
     return age is not None and age < FRESH_SECONDS
 
 
-def _push(event):
+def _push(event, profile="default"):
     from .dashboard.sync.inbox import Inbox
 
-    Inbox(_sync_dir() / "inbox").put(event)
+    Inbox(_sync_dir(profile) / "inbox").put(event)
 
 
 def _allowed_users():
@@ -96,44 +136,52 @@ async def _seen(message):
         await message.add_reaction(SEEN)
 
 
-async def _refuse_mention(message):
+async def _refuse_mention(message, profile):
     """A sync mention never falls back to a native thread: say the sync is down instead."""
-    age = _heartbeat_age()
+    age = _heartbeat_age(profile)
     shown = "never" if age is None else f"{age:.0f}s ago"
     log.warning("Discord sync refused mention %s: bridge heartbeat %s", message.id, shown)
     with contextlib.suppress(Exception):
         await message.reply(f"{OFFLINE} (last heartbeat: {shown})", mention_author=False)
 
 
-async def _claim(bot, message, forum_id):
-    """Push a message to the bridge when it owns it. False leaves it to the normal bot."""
-    if not _bridge_alive():
-        if _is_sync_mention(bot, message):
-            await _refuse_mention(message)
-            return True
-        return False
+async def _claim(bot, message, forums):
+    """Push a message to the bridge that owns it. False leaves it to the normal bot."""
     channel = message.channel
-    if str(getattr(channel, "parent_id", "")) == forum_id:
+    profile = forums.get(str(getattr(channel, "parent_id", "")))
+    if profile is not None:
+        if not _bridge_alive(profile):
+            return False
         thread = {"thread": str(channel.id), "name": getattr(channel, "name", None)}
-        _push({"kind": "forum", **thread, "message": _message_dict(message)})
+        _push({"kind": "forum", **thread, "message": _message_dict(message)}, profile)
         if _from_allowed_person(message):
             await _seen(message)
         return True
-    if _is_sync_mention(bot, message):
-        _push({"kind": "mention", "channel": str(channel.id), "message": _message_dict(message)})
-        await _seen(message)
+    if not _is_sync_mention(bot, message):
+        return False
+    # A mention starts a post in the forum of the profile its channel is routed to.
+    profile = _routed_profile(message)
+    if profile not in forums.values():
+        return False
+    if not _bridge_alive(profile):
+        await _refuse_mention(message, profile)
         return True
-    return False
+    _push({"kind": "mention", "channel": str(channel.id), "message": _message_dict(message)}, profile)
+    await _seen(message)
+    return True
 
 
-async def _press(interaction):
+async def _press(interaction, forums):
     """Acknowledge one of our buttons within Discord's 3 seconds, then hand it to the bridge."""
     data = getattr(interaction, "data", None) or {}
     custom_id = str(data.get("custom_id", ""))
     if not custom_id.startswith(BUTTON_PREFIX):
         return
     user = getattr(interaction, "user", None)
-    if not _bridge_alive():
+    # Buttons live in a forum post; its forum says which profile's bridge holds the request.
+    parent = getattr(getattr(interaction, "channel", None), "parent_id", None)
+    profile = forums.get(str(parent), "default")
+    if not _bridge_alive(profile):
         with contextlib.suppress(Exception):
             await interaction.response.send_message(OFFLINE, ephemeral=True)
         return
@@ -144,7 +192,8 @@ async def _press(interaction):
             "custom_id": custom_id,
             "user": str(getattr(user, "id", "")),
             "name": getattr(user, "display_name", None),
-        }
+        },
+        profile,
     )
     try:
         await interaction.response.defer()
@@ -153,9 +202,10 @@ async def _press(interaction):
 
 
 def register(ctx):
-    forum_id = str(ctx.get_config("forum_id", ""))
-    if not forum_id.isdecimal():
+    forums = _forums(ctx)
+    if not forums:
         return
+    forum_id = ",".join(sorted(forums))
 
     def install(bot, adapter):
         # Native discord.py event registration is the documented plugin seam.
@@ -171,14 +221,14 @@ def register(ctx):
             if previous_update is not None:
                 await previous_update(payload)
             data = getattr(payload, "data", None) or {}
-            in_forum = str(data.get("parent_id")) == forum_id
-            if in_forum and _bridge_alive():
+            profile = forums.get(str(data.get("parent_id")))
+            if profile is not None and _bridge_alive(profile):
                 tags = [str(tag) for tag in data.get("applied_tags") or []]
-                _push({"kind": "tags", "thread": str(data.get("id")), "tags": tags})
+                _push({"kind": "tags", "thread": str(data.get("id")), "tags": tags}, profile)
 
         @bot.event
         async def on_message(message):
-            if await _claim(bot, message, forum_id):
+            if await _claim(bot, message, forums):
                 return
             await previous_message(message)
 
@@ -186,7 +236,7 @@ def register(ctx):
         async def on_interaction(interaction):
             if previous_interaction is not None:
                 await previous_interaction(interaction)
-            await _press(interaction)
+            await _press(interaction, forums)
 
         def restore(name, ours, previous):
             if getattr(bot, name, None) is not ours:

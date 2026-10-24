@@ -165,8 +165,11 @@ class Bridge:
         auto_link=True,
         wording=None,
         clock=time.monotonic,
+        profile=None,
     ):
         self.rpc = rpc
+        # The Hermes profile whose sessions this forum mirrors; None is the default profile.
+        self.profile = profile
         self.discord = discord
         self.store = store
         self.forum = str(forum)
@@ -234,6 +237,10 @@ class Bridge:
             (link for link in self.store.links() if self.runtime.get(link["session"]) == runtime), None
         )
 
+    def _scoped(self, params):
+        """Session RPC params aimed at this bridge's profile."""
+        return {**params, "profile": self.profile} if self.profile else params
+
     def _from_allowed_user(self, message):
         author = message.get("author") or {}
         automated = author.get("bot") or message.get("webhook_id")
@@ -244,13 +251,15 @@ class Bridge:
     async def attach(self, link):
         snapshot = await self.rpc.call(
             "session.resume",
-            {
-                "session_id": link["session"],
-                "lazy": True,
-                "defer_history": True,
-                "inline_images": False,
-                "close_on_disconnect": False,
-            },
+            self._scoped(
+                {
+                    "session_id": link["session"],
+                    "lazy": True,
+                    "defer_history": True,
+                    "inline_images": False,
+                    "close_on_disconnect": False,
+                }
+            ),
         )
         runtime = snapshot["session_id"]
         self.runtime[link["session"]] = runtime
@@ -284,7 +293,7 @@ class Bridge:
         if row is None:
             row = await self._session_row(session)
         if row is None or row.get("source") not in DESKTOP_SOURCES:
-            raise ValueError("Select a desktop session in the default profile")
+            raise ValueError("Select a desktop session in this profile")
         await self._open_post(session, row.get("title") or session)
         link = self._by_session(session)
         await self.attach(link)
@@ -293,7 +302,7 @@ class Bridge:
     async def _session_row(self, session):
         # Resolve before publishing anything. Only desktop conversations in
         # this profile may be exposed; no title-based or foreign fallback.
-        listing = await self.rpc.call("session.list", {"limit": 10000})
+        listing = await self.rpc.call("session.list", self._scoped({"limit": 10000}))
         return next((row for row in listing["sessions"] if row["id"] == session), None)
 
     async def _open_post(self, session, title):
@@ -307,7 +316,9 @@ class Bridge:
     async def _new_session(self, title, key):
         created = await self.rpc.call(
             "session.create",
-            {"source": "desktop", "title": title, "close_on_disconnect": False, "idempotency_key": key},
+            self._scoped(
+                {"source": "desktop", "title": title, "close_on_disconnect": False, "idempotency_key": key}
+            ),
         )
         session = created["stored_session_id"]
         runtime = created["session_id"]
@@ -376,7 +387,7 @@ class Bridge:
             await self._auto_link_next()
 
     async def _auto_link_next(self):
-        listing = await self.rpc.call("session.list", {"limit": 500})
+        listing = await self.rpc.call("session.list", self._scoped({"limit": 500}))
         candidate = next((row for row in listing["sessions"] if self._should_auto_link(row)), None)
         if candidate is None:
             return

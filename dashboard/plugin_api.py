@@ -56,10 +56,27 @@ def settings():
     if named_profile_home(home) is not None:
         raise HTTPException(403, "Discord sync is configured for the default profile only")
     entry = plugins.get("entries", {}).get(PLUGIN, {}).get("settings", {})
-    forum = str(entry.get("forum_id", ""))
-    if not forum.isdecimal():
+    return home, entry, forums(home, entry)
+
+
+def forums(home, entry):
+    """Profile name -> (its Hermes home, its forum id). Default is "default"; each profile owns one forum."""
+    from hermes_cli.profiles import get_profile_dir
+
+    found = {}
+    if entry.get("forum_id"):
+        found["default"] = (home, str(entry["forum_id"]))
+    for name, profile in (entry.get("profiles") or {}).items():
+        profile_home = Path(get_profile_dir(str(name))).resolve()
+        if profile_home == home or not (profile_home / "config.yaml").is_file():
+            raise HTTPException(409, f"Discord sync profile {name} is not an installed profile")
+        found[str(name)] = (profile_home, str((profile or {}).get("forum_id", "")))
+    forum_ids = [forum for _, forum in found.values()]
+    if not found or not all(forum.isdecimal() for forum in forum_ids):
         raise HTTPException(409, "Set plugins.entries.discord-sync.settings.forum_id")
-    return home, entry, forum
+    if len(set(forum_ids)) != len(forum_ids):
+        raise HTTPException(409, "Each Discord sync profile needs its own forum")
+    return found
 
 
 def _credentials(home, entry):
@@ -108,10 +125,13 @@ def _connection_url(app, port):
     return url
 
 
-def _notify(session):
-    from hermes_cli.plugin_events import broadcast_plugin_event
+def _notifier(profile):
+    def notify(session):
+        from hermes_cli.plugin_events import broadcast_plugin_event
 
-    broadcast_plugin_event(PLUGIN, "transcript", {"session_id": session, "profile": "default"})
+        broadcast_plugin_event(PLUGIN, "transcript", {"session_id": session, "profile": profile})
+
+    return notify
 
 
 class HermesPins:
@@ -161,11 +181,11 @@ class HermesThreads:
 
 
 class _Service:
-    """Runs the bridge on its own loop thread for the life of the backend."""
+    """Runs one bridge per synced profile on its own loop thread for the life of the backend."""
 
     def __init__(self):
         self.loop = None
-        self.bridge = None
+        self.bridges = {}
         self.thread = None
         self.error = "starting"
         self.lock = threading.Lock()
@@ -196,7 +216,7 @@ class _Service:
     async def _configured(self):
         while True:
             try:
-                home, entry, forum = settings()
+                home, entry, found = settings()
                 token, users = _credentials(home, entry)
             except (HTTPException, ValueError) as error:
                 self.error = getattr(error, "detail", None) or str(error)
@@ -204,34 +224,41 @@ class _Service:
                 await asyncio.sleep(SETTINGS_RETRY_SECONDS)
                 continue
             self.error = None
-            return home, entry, forum, token, users
+            return entry, found, token, users
 
     async def _main(self, app):
-        home, entry, forum, token, users = await self._configured()
-        sync_dir = home / "discord-sync"
-        heartbeat = sync_dir / "heartbeat"
+        entry, found, token, users = await self._configured()
         async with aiohttp.ClientSession() as http:
-            self.bridge = Bridge(
-                Rpc(http, _connection_url(app, app.state.bound_port)),
-                Discord(http, token, str(entry.get("discord_api", API))),
-                Store(sync_dir / "state.db"),
-                forum,
-                users,
-                inbox=Inbox(sync_dir / "inbox"),
-                pins=HermesPins(home),
-                threads=HermesThreads(home),
-                notify=_notify,
-                heartbeat=heartbeat.touch,
-                auto_link=bool(entry.get("auto_link", True)),
-                wording=HermesWording(),
-            )
-            log.info("Discord sync started for forum %s", forum)
-            await self.bridge.serve()
+            for profile, (profile_home, forum) in found.items():
+                sync_dir = profile_home / "discord-sync"
+                self.bridges[profile] = Bridge(
+                    Rpc(http, _connection_url(app, app.state.bound_port)),
+                    Discord(http, token, str(entry.get("discord_api", API))),
+                    Store(sync_dir / "state.db"),
+                    forum,
+                    users,
+                    inbox=Inbox(sync_dir / "inbox"),
+                    pins=HermesPins(profile_home),
+                    threads=HermesThreads(profile_home),
+                    notify=_notifier(profile),
+                    heartbeat=(sync_dir / "heartbeat").touch,
+                    auto_link=bool(entry.get("auto_link", True)),
+                    wording=HermesWording(),
+                    profile=None if profile == "default" else profile,
+                )
+                log.info("Discord sync started for profile %s, forum %s", profile, forum)
+            await asyncio.gather(*(bridge.serve() for bridge in self.bridges.values()))
 
-    async def call(self, coroutine_factory):
-        if self.loop is None or self.bridge is None:
+    def bridge(self, profile):
+        if self.loop is None or not self.bridges:
             raise HTTPException(503, self.error or "Discord sync is starting")
-        future = asyncio.run_coroutine_threadsafe(coroutine_factory(self.bridge), self.loop)
+        bridge = self.bridges.get(profile or "default")
+        if bridge is None:
+            raise HTTPException(404, f"Discord sync is not set up for profile {profile}")
+        return bridge
+
+    async def call(self, bridge, coroutine_factory):
+        future = asyncio.run_coroutine_threadsafe(coroutine_factory(bridge), self.loop)
         return await asyncio.wrap_future(future)
 
 
@@ -242,32 +269,36 @@ router = APIRouter()
 @router.post("/start")
 async def start(request: Request):
     _identity(request)
-    _, entry, _ = settings()
+    _, entry, found = settings()
     _service.ensure()
-    return {"started": True, "auto_link": bool(entry.get("auto_link", True))}
+    return {"started": True, "auto_link": bool(entry.get("auto_link", True)), "profiles": sorted(found)}
 
 
 @router.get("/status")
 async def status(request: Request):
     _identity(request)
-    if _service.bridge is None:
-        return {"connected": False, "links": [], "error": _service.error}
+    if not _service.bridges:
+        return {"connected": False, "profiles": {}, "error": _service.error}
 
     async def read(bridge):
         return {"connected": bridge.connected, "links": bridge.store.links(), "error": bridge.last_error}
 
-    return await _service.call(read)
+    profiles = {name: await _service.call(bridge, read) for name, bridge in _service.bridges.items()}
+    connected = all(profile["connected"] for profile in profiles.values())
+    return {"connected": connected, "profiles": profiles, "error": _service.error}
 
 
 class LinkBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_id: str
+    profile: str = "default"
 
 
 @router.post("/link")
 async def link(body: LinkBody, request: Request):
     _identity(request)
     _service.ensure()
+    bridge = _service.bridge(body.profile)
 
     async def wait_then_link(bridge):
         for _ in range(100):
@@ -282,7 +313,7 @@ async def link(body: LinkBody, request: Request):
             raise HTTPException(400, str(error)) from error
         return {**linked, "url": f"https://discord.com/channels/{bridge.discord.guild}/{linked['thread']}"}
 
-    return await _service.call(wait_then_link)
+    return await _service.call(bridge, wait_then_link)
 
 
 # Start with the backend itself: no Desktop window or toggle is required.

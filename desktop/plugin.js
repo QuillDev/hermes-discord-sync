@@ -14,6 +14,7 @@ export default {
   register(ctx) {
     let disposed = false
     let autoLink = true
+    let profiles = new Set(['default'])
     let starting = null
     let pendingAutoLink = null
     const linked = new Set()
@@ -21,6 +22,7 @@ export default {
 
     function rememberSettings(result) {
       autoLink = result.auto_link !== false
+      profiles = new Set(result.profiles || ['default'])
     }
 
     function retryStartLater(error) {
@@ -35,46 +37,46 @@ export default {
       return starting
     }
 
-    function focusedDefaultSession() {
-      const profile = host.state.focusedSessionProfile.get()
+    // Each synced profile has its own forum; sessions of other profiles stay off Discord.
+    function focusedSyncedSession() {
+      const profile = host.state.focusedSessionProfile.get() || 'default'
       const session = host.state.focusedStoredSessionId.get()
-      const otherProfile = Boolean(profile) && profile !== 'default'
-      if (disposed || !session || otherProfile) {
+      if (disposed || !session || !profiles.has(profile)) {
         return null
       }
-      return session
+      return { session, profile }
     }
 
-    async function linkSession(session) {
+    async function linkSession({ session, profile }) {
       const result = await ctx.rest('/link', {
         method: 'POST',
-        body: { session_id: session },
+        body: { session_id: session, profile },
         timeoutMs: LINK_TIMEOUT_MS
       })
-      linked.add(session)
+      linked.add(`${profile}/${session}`)
       return result
     }
 
     async function autoLinkFocused() {
-      const session = focusedDefaultSession()
-      if (!session) {
+      await start()
+      const focused = focusedSyncedSession()
+      if (!focused) {
         return
       }
-      await start()
-      const shouldLink = autoLink && !linked.has(session)
+      const shouldLink = autoLink && !linked.has(`${focused.profile}/${focused.session}`)
       if (!shouldLink) {
         return
       }
-      await linkSession(session)
+      await linkSession(focused)
     }
 
     async function linkFocusedAndOpen() {
-      const session = focusedDefaultSession()
-      if (!session) {
+      await start()
+      const focused = focusedSyncedSession()
+      if (!focused) {
         return
       }
-      await start()
-      const result = await linkSession(session)
+      const result = await linkSession(focused)
       await ctx.os.openExternal(result.url)
     }
 
@@ -89,16 +91,18 @@ export default {
 
     function refreshTranscript(event) {
       const session = event.payload?.session_id
-      if (disposed || !session || refreshing.has(session)) {
+      const profile = event.payload?.profile || 'default'
+      const key = `${profile}/${session}`
+      if (disposed || !session || refreshing.has(key)) {
         return
       }
-      refreshing.add(session)
+      refreshing.add(key)
       // This SDK operation refreshes existing tiles in place. It never focuses
       // or opens an unrelated conversation, nor submits a second agent turn.
       void host
-        .openSession(session, { profile: 'default', refreshInPlace: true })
+        .openSession(session, { profile, refreshInPlace: true })
         .catch(reportError)
-        .finally(() => refreshing.delete(session))
+        .finally(() => refreshing.delete(key))
     }
 
     function dispose() {

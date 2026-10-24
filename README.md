@@ -42,6 +42,16 @@ plugins:
         auto_link: true                # link new Desktop sessions automatically
 ```
 
+To keep another profile's sessions in a forum of its own, add it under `profiles`. Its sessions, posts and @mentions stay in that profile:
+
+```yaml
+        profiles:
+          personal:
+            forum_id: 234567890123456789
+```
+
+An @mention starts a post in the forum of the profile its channel is routed to by `gateway.profile_routes`, and in the default forum otherwise. Route the profile's forum there too, so the gateway answers it in that profile while the sync is down.
+
 Restart the gateway and the backend so both halves load.
 
 ## How it works

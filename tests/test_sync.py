@@ -6,10 +6,11 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 
-from dashboard.sync.bridge import AUDIT_LAG, POLL_EVERY, SCAN_EVERY, STREAM_EDIT_EVERY
-from dashboard.sync.discord import chunks
+from dashboard.sync.bridge import AUDIT_LAG, POLL_EVERY, SCAN_EVERY, STREAM_EDIT_EVERY, Bridge
+from dashboard.sync.discord import Discord, chunks
 from dashboard.sync.inbox import Inbox
 from dashboard.sync.rpc import Rpc
 from dashboard.sync.store import Store
@@ -544,6 +545,49 @@ async def test_an_at_mention_starts_a_synced_forum_post_and_points_to_it(world):
     assert len([row for row in external.sessions if row["title"] == "check disk usage"]) == 1
 
 
+async def test_a_profile_forum_keeps_its_sessions_in_that_profile(world, tmp_path):
+    external = world.external
+    async with aiohttp.ClientSession() as http:
+        rpc = Rpc(http, world.base + "/api/ws")
+        await rpc.connect()
+        personal = Bridge(
+            rpc,
+            Discord(http, "test-token", world.base + "/discord"),
+            Store(tmp_path / "personal" / "state.db"),
+            "personal-forum",
+            ["42"],
+            clock=world.clock,
+            profile="personal",
+        )
+        await personal.discord.validate("personal-forum")
+        # Posts from before a bridge started belong to the native gateway.
+        await asyncio.sleep(0.01)
+        try:
+            post = external.add_post("plan the trip", "book flights", parent="personal-forum")
+            work_post = external.add_post("fix the build", "please fix it")
+            await personal.tick()
+            await world.bridge.tick()
+            by_title = {row["title"]: row for row in external.sessions}
+            assert by_title["plan the trip"]["profile"] == "personal"
+            assert by_title["fix the build"]["profile"] == "default"
+            assert [link["thread"] for link in personal.store.links()] == [post]
+            assert work_post in [link["thread"] for link in world.bridge.store.links()]
+            assert post not in [link["thread"] for link in world.bridge.store.links()]
+            # A new personal desktop session gets a post in the personal forum only.
+            fresh = {"id": "diary", "source": "desktop", "title": "diary", "started_at": time.time() + 1}
+            external.sessions.append({**fresh, "key": None, "profile": "personal"})
+            world.clock.advance(SCAN_EVERY)
+            await personal.tick()
+            await world.bridge.tick()
+            diary = [thread for thread in external.threads.values() if thread["name"] == "diary"]
+            assert [thread["parent_id"] for thread in diary] == ["personal-forum"]
+            with pytest.raises(ValueError):
+                await world.bridge.link("diary")
+        finally:
+            await personal.close()
+            personal.store.close()
+
+
 async def test_a_pushed_forum_reply_runs_once_even_when_the_poll_sees_it_too(world):
     bridge, external, link = world.bridge, world.external, world.link
     await bridge.tick()
@@ -577,7 +621,7 @@ async def test_the_gateway_yields_the_sync_forum_while_the_bridge_is_alive_and_n
     installers = []
     disposers = []
     ctx = SimpleNamespace(
-        get_config=lambda key, default: "123",
+        get_config=lambda key, default: {"forum_id": "123"}.get(key, default),
         on_unload=disposers.append,
         register_platform_handler=lambda platform, install: installers.append(install),
     )
@@ -790,7 +834,7 @@ async def test_a_multiplexed_gateway_still_hands_allowed_mentions_to_the_bridge(
     installers = []
     plugin.register(
         SimpleNamespace(
-            get_config=lambda key, default: "123",
+            get_config=lambda key, default: {"forum_id": "123"}.get(key, default),
             on_unload=lambda dispose: None,
             register_platform_handler=lambda platform, install: installers.append(install),
         )
@@ -841,6 +885,119 @@ async def test_a_multiplexed_gateway_still_hands_allowed_mentions_to_the_bridge(
     pushed = [event["message"]["content"] for _, event in inbox.pending()]
     assert pushed == ["<@42> from quill"]
     assert answered_by_gateway == ["<@42> from a stranger"]
+
+
+async def test_each_profile_forum_and_routed_mention_reaches_that_profiles_bridge(tmp_path, monkeypatch):
+    sys.path.insert(0, str(HERMES_AGENT))
+    # A home of its own, so profiles resolve under this HERMES_HOME wherever the temp dir lives.
+    monkeypatch.setenv("HOME", str(tmp_path / "user"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "217")
+    # The gateway routes the personal text channel to the personal profile.
+    (tmp_path / "config.yaml").write_text(
+        "gateway:\n  multiplex_profiles: true\n  profile_routes:\n"
+        "    - {name: personal, platform: discord, chat_id: '88', profile: personal}\n"
+    )
+    (tmp_path / "profiles" / "personal").mkdir(parents=True)
+    (tmp_path / "profiles" / "personal" / "config.yaml").write_text("{}\n")
+    spec = importlib.util.spec_from_file_location(
+        "sync_plugin_profiles", PLUGIN_ROOT / "__init__.py", submodule_search_locations=[str(PLUGIN_ROOT)]
+    )
+    plugin = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = plugin
+    spec.loader.exec_module(plugin)
+    settings = {"forum_id": "123", "profiles": {"personal": {"forum_id": "456"}}}
+    installers = []
+    plugin.register(
+        SimpleNamespace(
+            get_config=lambda key, default: settings.get(key, default),
+            on_unload=lambda dispose: None,
+            register_platform_handler=lambda platform, install: installers.append(install),
+        )
+    )
+    answered_by_gateway = []
+    replies = []
+
+    class NativeBot:
+        user = SimpleNamespace(id=42)
+
+        async def on_message(self, message):
+            answered_by_gateway.append(message.content)
+
+        def event(self, handler):
+            setattr(self, handler.__name__, handler)
+            return handler
+
+    class TextChannel(SimpleNamespace):
+        pass
+
+    async def add_reaction(emoji):
+        pass
+
+    def message(content, channel, mentions=()):
+        async def reply(text, mention_author=True):
+            replies.append((content, text))
+
+        return SimpleNamespace(
+            channel=channel,
+            content=content,
+            id=5,
+            author=SimpleNamespace(id="217", bot=False),
+            mentions=list(mentions),
+            guild=SimpleNamespace(id=1),
+            webhook_id=None,
+            attachments=[],
+            add_reaction=add_reaction,
+            reply=reply,
+        )
+
+    async def defer():
+        pass
+
+    bot = NativeBot()
+    installers[0](bot, None)
+    work_dir = tmp_path / "discord-sync"
+    personal_dir = tmp_path / "profiles" / "personal" / "discord-sync"
+    for sync_dir in (work_dir, personal_dir):
+        sync_dir.mkdir(parents=True)
+        (sync_dir / "heartbeat").touch()
+    personal_channel = TextChannel(id=88, parent_id=None)
+    work_channel = TextChannel(id=77, parent_id=None)
+    await bot.on_message(message("work post", SimpleNamespace(id=1, parent_id=123)))
+    await bot.on_message(message("personal post", SimpleNamespace(id=2, parent_id=456)))
+    await bot.on_message(message("<@42> work task", work_channel, [bot.user]))
+    await bot.on_message(message("<@42> personal task", personal_channel, [bot.user]))
+    await bot.on_message(message("plain personal chat", personal_channel))
+    await bot.on_raw_thread_update(SimpleNamespace(data={"id": 2, "parent_id": 456, "applied_tags": [9]}))
+    await bot.on_interaction(
+        SimpleNamespace(
+            data={"custom_id": "hds:approve:srq-1:once"},
+            user=SimpleNamespace(id="217", display_name="Quill"),
+            channel=SimpleNamespace(id=2, parent_id=456),
+            response=SimpleNamespace(defer=defer),
+        )
+    )
+
+    def pushed(sync_dir):
+        events = [event for _, event in Inbox(sync_dir / "inbox").pending()]
+        return [(event["kind"], event.get("message", {}).get("content")) for event in events]
+
+    assert pushed(work_dir) == [("forum", "work post"), ("mention", "<@42> work task")]
+    assert pushed(personal_dir) == [
+        ("forum", "personal post"),
+        ("mention", "<@42> personal task"),
+        ("tags", None),
+        ("press", None),
+    ]
+    assert answered_by_gateway == ["plain personal chat"]
+    # With only the personal bridge down, its mention is refused and its forum goes back to the gateway.
+    os.utime(personal_dir / "heartbeat", (1, 1))
+    await bot.on_message(message("<@42> personal while down", personal_channel, [bot.user]))
+    await bot.on_message(message("personal post while down", SimpleNamespace(id=2, parent_id=456)))
+    await bot.on_message(message("work post still synced", SimpleNamespace(id=1, parent_id=123)))
+    assert [content for content, _ in replies] == ["<@42> personal while down"]
+    assert answered_by_gateway[-1] == "personal post while down"
+    assert pushed(work_dir)[-1] == ("forum", "work post still synced")
 
 
 async def poll(world):
