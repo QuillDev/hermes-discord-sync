@@ -33,6 +33,8 @@ class ExternalServices:
         self.open_requests = []
         self.sessions = []
         self.forum_tags = []
+        # Forum channels in the server; each profile syncs its own.
+        self.forums = {"forum", "personal-forum"}
         self.typing = []
         # The bot's reactions: (channel, message id) -> emoji, in the order they were added.
         self.reactions = {}
@@ -120,9 +122,10 @@ class ExternalServices:
             if method == "client.capabilities":
                 result = {"server_requests": ["approval", "clarify"]}
             elif method == "session.list":
-                result = {
-                    "sessions": [{"id": "session-one", "source": "desktop", "title": "task"}, *self.sessions]
-                }
+                # Each profile has its own session store; session-one lives in default.
+                profile = params.get("profile") or "default"
+                listed = [{"id": "session-one", "source": "desktop", "title": "task"}, *self.sessions]
+                result = {"sessions": [row for row in listed if row.get("profile", "default") == profile]}
             elif method == "session.create":
                 existing = next(
                     (row for row in self.sessions if row["key"] == params.get("idempotency_key")), None
@@ -134,6 +137,7 @@ class ExternalServices:
                         "title": params.get("title", ""),
                         "started_at": time.time(),
                         "key": params.get("idempotency_key"),
+                        "profile": params.get("profile") or "default",
                     }
                     self.sessions.append(existing)
                 result = {"session_id": "live-" + existing["id"], "stored_session_id": existing["id"]}
@@ -217,12 +221,12 @@ class ExternalServices:
         path = ["forum" if part == "555" else part for part in request.match_info["tail"].split("/")]
         method = request.method
         channel = path[1] if len(path) > 1 else ""
-        if path == ["channels", "forum"]:
+        if len(path) == 2 and path[0] == "channels" and channel in self.forums:
             if method == "PATCH":
                 tags = (await request.json())["available_tags"]
                 self.forum_tags = [{**tag, "id": tag.get("id") or self.mid()} for tag in tags]
             return web.json_response(
-                {"id": "forum", "type": 15, "guild_id": "guild", "available_tags": self.forum_tags}
+                {"id": channel, "type": 15, "guild_id": "guild", "available_tags": self.forum_tags}
             )
         if path[0] == "guilds" and path[2] == "audit-logs":
             assert request.query["action_type"] == "111"
@@ -239,7 +243,8 @@ class ExternalServices:
         if len(path) == 3 and path[2] == "threads" and method == "POST":
             payload = await request.json()
             tid = self.mid()
-            self.threads[tid] = {"name": payload["name"], "messages": [], "archived": False}
+            post = {"name": payload["name"], "messages": [], "archived": False, "parent_id": channel}
+            self.threads[tid] = post
             starter = self.add_message(tid, payload["message"]["content"], "bot")
             return web.json_response({"id": tid, "message": starter})
         if len(path) == 3 and path[2] == "typing":
