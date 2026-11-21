@@ -11,9 +11,12 @@ from urllib.parse import quote
 
 import aiohttp
 
+from .host import NAME as HOST
+
 log = logging.getLogger("hermes.discord-sync")
 
 API = "https://discord.com/api/v10"
+USER_AGENT = f"{HOST.capitalize()}DiscordSync/0.1"
 FORUM_CHANNEL = 15
 THREAD_UPDATE = 111
 DISCORD_EPOCH_MS = 1420070400000
@@ -66,7 +69,7 @@ class Discord:
     async def request(self, method, path, *, body=None, form=None, missing_ok=False):
         for _ in range(6):
             options = {
-                "headers": {"Authorization": f"Bot {self.token}", "User-Agent": "HermesDiscordSync/0.1"},
+                "headers": {"Authorization": f"Bot {self.token}", "User-Agent": USER_AGENT},
                 "allow_redirects": False,
                 "timeout": aiohttp.ClientTimeout(total=60),
             }
@@ -102,7 +105,7 @@ class Discord:
             body={
                 "name": (title or session)[:TITLE_LIMIT],
                 "auto_archive_duration": 10080,
-                "message": {"content": f"hermes session: `{session}`", "allowed_mentions": NO_MENTIONS},
+                "message": {"content": f"{HOST} session: `{session}`", "allowed_mentions": NO_MENTIONS},
             },
         )
 
